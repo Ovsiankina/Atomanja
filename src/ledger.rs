@@ -370,6 +370,31 @@ fn idx(id: u32) -> usize {
     id as usize
 }
 
+/// Changes being built by one [`Ledger::observe`] call, with the row ids
+/// they have claimed so far.
+struct Batch {
+    out: Vec<Change>,
+    next_occ: u32,
+}
+
+impl Batch {
+    /// A task seen without a current occurrence (APP-4, APP-5).
+    fn first_sight(&mut self, o: &Observation, now: Timestamp) {
+        if let Some(due) = tracked_due(o) {
+            if due > now {
+                self.record(o, due, now);
+            }
+        }
+    }
+
+    /// Start a new occurrence.
+    fn record(&mut self, o: &Observation, deadline: Timestamp, now: Timestamp) {
+        let occurrence = OccurrenceId(self.next_occ);
+        self.next_occ += 1;
+        self.out.push(Change::Recorded { occurrence, task: o.task, deadline, at: now });
+    }
+}
+
 /// The due date of a tracked task (APP-3), `None` when not tracked.
 fn tracked_due(o: &Observation) -> Option<Timestamp> {
     if o.archived { None } else { o.due }
@@ -395,6 +420,23 @@ impl Ledger {
                 self.tracking.last_seen.push(Seen::Due(deadline));
                 self.current.insert(task, occurrence);
             }
+            Change::Event { occurrence, kind, new_due, at } => {
+                let i = idx(occurrence.0);
+                self.events.new_due.push(new_due);
+                self.events.at.push(at);
+                self.events.occurrence.push(occurrence);
+                self.events.kind.push(kind);
+                self.tracking.last_seen[i] = match (kind, new_due) {
+                    (EventKind::Deleted, _) => Seen::Gone,
+                    (_, None) => Seen::NoDue,
+                    (_, Some(d)) => Seen::Due(d),
+                };
+                if kind == EventKind::MovedEarlier {
+                    if let Some(d) = new_due {
+                        self.occurrences.deadline[i] = d;
+                    }
+                }
+            }
             _ => todo!(),
         }
     }
@@ -412,25 +454,64 @@ impl Ledger {
         real_witnesses: &[WitnessId],
     ) -> Vec<Change> {
         let _ = real_witnesses;
-        let mut out = Vec::new();
-        let mut next_occ = next_id(self.occurrences.task.len());
+        let mut batch = Batch {
+            out: Vec::new(),
+            next_occ: next_id(self.occurrences.task.len()),
+        };
+        // DECISION: tasks are handled one by one in task-id order (seen
+        // tasks and vanished ones alike), each emitting its own changes in
+        // dependency order. Deterministic whatever the snapshot order, and
+        // every change only refers to rows created earlier in the list.
+        let mut seen: std::collections::BTreeMap<TaskId, &Observation> =
+            std::collections::BTreeMap::new();
         for o in &snapshot.tasks {
-            if self.current.contains_key(&o.task) {
-                continue;
-            }
-            if let Some(due) = tracked_due(o) {
-                if due > now {
-                    out.push(Change::Recorded {
-                        occurrence: OccurrenceId(next_occ),
-                        task: o.task,
-                        deadline: due,
-                        at: now,
-                    });
-                    next_occ += 1;
+            seen.insert(o.task, o);
+        }
+        let mut tasks: Vec<TaskId> = seen.keys().copied().collect();
+        tasks.extend(self.current.keys().filter(|k| !seen.contains_key(k)));
+        tasks.sort_unstable();
+        for task in tasks {
+            let o = seen.get(&task).copied();
+            match self.current.get(&task) {
+                Some(&occ) => self.step_tracked(occ, o, now, &mut batch),
+                None => {
+                    if let Some(o) = o {
+                        batch.first_sight(o, now);
+                    }
                 }
             }
         }
-        out
+        batch.out
+    }
+
+    /// One poll's changes for a task that already has an occurrence.
+    fn step_tracked(
+        &self,
+        occ: OccurrenceId,
+        o: Option<&Observation>,
+        now: Timestamp,
+        batch: &mut Batch,
+    ) {
+        let i = idx(occ.0);
+        let recorded = self.occurrences.deadline[i];
+        let seen = match o {
+            None => Seen::Gone,
+            Some(o) if o.archived => Seen::Gone,
+            Some(o) => o.due.map_or(Seen::NoDue, Seen::Due),
+        };
+        if seen != self.tracking.last_seen[i] {
+            let (kind, new_due) = match seen {
+                Seen::Gone => (EventKind::Deleted, None),
+                Seen::NoDue => (EventKind::Removed, None),
+                // DECISION: "earlier" and "later" are measured against the
+                // recorded deadline, not the previous due date, so the
+                // recorded deadline only ever moves earlier (APP-7), and a
+                // move back towards it is logged as MovedLater.
+                Seen::Due(d) if d < recorded => (EventKind::MovedEarlier, Some(d)),
+                Seen::Due(d) => (EventKind::MovedLater, Some(d)),
+            };
+            batch.out.push(Change::Event { occurrence: occ, kind, new_due, at: now });
+        }
     }
 
     /// A real witness claims an unclaimed debt (APP-18, APP-19, APP-20).
@@ -638,12 +719,107 @@ mod tests {
     }
 
     // ledger-02
-    #[test] fn app_4_records_future_deadline() { todo!() }
-    #[test] fn app_5_past_due_at_first_sight_no_record() { todo!() }
-    #[test] fn app_6_moved_later_keeps_recorded_and_logs_event() { todo!() }
-    #[test] fn app_6_removed_due_keeps_recorded_and_logs_event() { todo!() }
-    #[test] fn app_6_deleted_task_keeps_recorded_and_logs_event() { todo!() }
-    #[test] fn app_7_moved_earlier_updates_recorded_and_logs_event() { todo!() }
+    #[test]
+    fn app_4_records_future_deadline() {
+        let mut l = Ledger::new();
+        let changes = poll(&mut l, &snap(vec![obs(7, Some(DAY))]), 10, &[]);
+        assert_eq!(
+            changes,
+            vec![Change::Recorded {
+                occurrence: OccurrenceId(0),
+                task: TaskId(7),
+                deadline: t(DAY),
+                at: t(10),
+            }]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
+        // Seen again unchanged: nothing new.
+        assert!(poll(&mut l, &snap(vec![obs(7, Some(DAY))]), 20, &[]).is_empty());
+    }
+
+    #[test]
+    fn app_5_past_due_at_first_sight_no_record() {
+        let mut l = Ledger::new();
+        assert!(poll(&mut l, &snap(vec![obs(1, Some(100))]), 200, &[]).is_empty());
+        assert!(poll(&mut l, &snap(vec![obs(1, Some(100))]), 300, &[]).is_empty());
+        assert!(l.occurrences().task.is_empty());
+        assert!(l.debts().occurrence.is_empty());
+    }
+
+    #[test]
+    fn app_6_moved_later_keeps_recorded_and_logs_event() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let changes = poll(&mut l, &snap(vec![obs(1, Some(2 * DAY))]), 10, &[]);
+        assert_eq!(
+            changes,
+            vec![Change::Event {
+                occurrence: OccurrenceId(0),
+                kind: EventKind::MovedLater,
+                new_due: Some(t(2 * DAY)),
+                at: t(10),
+            }]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
+        assert_eq!(l.events().kind, vec![EventKind::MovedLater]);
+        // Logged once, not on every poll.
+        assert!(poll(&mut l, &snap(vec![obs(1, Some(2 * DAY))]), 20, &[]).is_empty());
+    }
+
+    #[test]
+    fn app_6_removed_due_keeps_recorded_and_logs_event() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let changes = poll(&mut l, &snap(vec![obs(1, None)]), 10, &[]);
+        assert_eq!(
+            changes,
+            vec![Change::Event {
+                occurrence: OccurrenceId(0),
+                kind: EventKind::Removed,
+                new_due: None,
+                at: t(10),
+            }]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
+        assert!(poll(&mut l, &snap(vec![obs(1, None)]), 20, &[]).is_empty());
+    }
+
+    #[test]
+    fn app_6_deleted_task_keeps_recorded_and_logs_event() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let changes = poll(&mut l, &snap(vec![]), 10, &[]);
+        assert_eq!(
+            changes,
+            vec![Change::Event {
+                occurrence: OccurrenceId(0),
+                kind: EventKind::Deleted,
+                new_due: None,
+                at: t(10),
+            }]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
+        assert_eq!(l.events().occurrence, vec![OccurrenceId(0)]);
+        assert!(poll(&mut l, &snap(vec![]), 20, &[]).is_empty());
+    }
+
+    #[test]
+    fn app_7_moved_earlier_updates_recorded_and_logs_event() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(2 * DAY))]), 0, &[]);
+        let changes = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 10, &[]);
+        assert_eq!(
+            changes,
+            vec![Change::Event {
+                occurrence: OccurrenceId(0),
+                kind: EventKind::MovedEarlier,
+                new_due: Some(t(DAY)),
+                at: t(10),
+            }]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
+        assert_eq!(l.events().new_due, vec![Some(t(DAY))]);
+    }
 
     // ledger-03
     #[test] fn app_8_recurrence_advance_closes_and_opens_occurrence() { todo!() }
