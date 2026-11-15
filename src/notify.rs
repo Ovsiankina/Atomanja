@@ -73,26 +73,46 @@ impl Message {
         let amount = format_amount(self.amount, self.lang);
         // DECISION: wording is short and names only `#<task>` and the
         // amount, so no message can leak a Vikunja field (APP-32).
-        let (title, body) = match self.kind {
-            MessageKind::ClaimedForYou => (
+        let (title, body) = match (self.lang, self.kind) {
+            (Lang::Fr, MessageKind::ClaimedForYou) => (
                 "Nouvelle dette pour vous",
                 format!("Tâche #{task} : {amount} vous sont dus."),
             ),
-            MessageKind::Claimable => (
+            (Lang::Fr, MessageKind::Claimable) => (
                 "Dette à réclamer",
                 format!("Tâche #{task} : {amount} à réclamer."),
             ),
-            MessageKind::Sent => (
+            (Lang::Fr, MessageKind::Sent) => (
                 "Paiement envoyé",
                 format!("Tâche #{task} : {amount} envoyés. Confirmez la réception."),
             ),
-            MessageKind::Claimed => (
+            (Lang::Fr, MessageKind::Claimed) => (
                 "Dette réclamée",
                 format!("Tâche #{task} : la dette de {amount} a été réclamée."),
             ),
-            MessageKind::Received => (
+            (Lang::Fr, MessageKind::Received) => (
                 "Paiement reçu",
                 format!("Tâche #{task} : réception de {amount} confirmée."),
+            ),
+            (Lang::En, MessageKind::ClaimedForYou) => (
+                "New debt for you",
+                format!("Task #{task}: {amount} is owed to you."),
+            ),
+            (Lang::En, MessageKind::Claimable) => (
+                "Debt to claim",
+                format!("Task #{task}: {amount} to claim."),
+            ),
+            (Lang::En, MessageKind::Sent) => (
+                "Payment sent",
+                format!("Task #{task}: {amount} sent. Confirm when received."),
+            ),
+            (Lang::En, MessageKind::Claimed) => (
+                "Debt claimed",
+                format!("Task #{task}: the {amount} debt was claimed."),
+            ),
+            (Lang::En, MessageKind::Received) => (
+                "Payment received",
+                format!("Task #{task}: receipt of {amount} confirmed."),
             ),
         };
         Text {
@@ -475,8 +495,7 @@ impl std::fmt::Debug for VapidKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VapidKeys")
             .field("public", &self.public_b64)
-            .field("private", &REDACTED)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -511,7 +530,7 @@ impl std::error::Error for NotifyError {
 mod tests {
     use super::{
         messages, tally, Message, MessageKind, Notifier, NotifyError, SendReport, Subscription,
-        VapidKeys,
+        Text, VapidKeys,
     };
     use crate::config::Config;
     use crate::auth::{Account, AccountId, PasswordHash, Role};
@@ -814,6 +833,57 @@ mod tests {
     }
 
     // notify-03
-    #[test] fn app_38_notification_default_french() { todo!() }
-    #[test] fn app_39_notification_uses_recipient_language() { todo!() }
+    #[test]
+    fn app_38_notification_default_french() {
+        // A new account has the default language, so it is told in French.
+        let accounts = vec![
+            account(WORKER, Role::Worker, Lang::default()),
+            account(ALICE, Role::Witness, Lang::default()),
+        ];
+        let got = run(&late_occurrence(), &[debt_created(), claimed(ALICE, true)], &accounts);
+        assert_eq!(got.len(), 2);
+        for m in &got {
+            assert_eq!(m.lang, Lang::Fr);
+        }
+        assert_eq!(
+            got[0].text(),
+            Text {
+                title: "Nouvelle dette pour vous".into(),
+                body: "Tâche #42 : 12,50 CHF vous sont dus.".into(),
+            }
+        );
+        assert_eq!(got[1].text().title, "Dette réclamée");
+    }
+
+    #[test]
+    fn app_39_notification_uses_recipient_language() {
+        // Alice reads English, Bob French, the worker English.
+        let accounts = vec![
+            account(WORKER, Role::Worker, Lang::En),
+            account(ALICE, Role::Witness, Lang::En),
+            account(BOB, Role::Witness, Lang::Fr),
+        ];
+        let got = run(&late_occurrence(), &[debt_created()], &accounts);
+        assert_eq!(got.iter().map(|m| (m.to, m.lang)).collect::<Vec<_>>(), vec![(ALICE, Lang::En), (BOB, Lang::Fr)]);
+        assert_eq!(
+            got[0].text(),
+            Text { title: "Debt to claim".into(), body: "Task #42: 12.50 CHF to claim.".into() }
+        );
+        assert_eq!(got[1].text().title, "Dette à réclamer");
+
+        // Every kind has distinct wording per language, never a title.
+        for kind in [
+            MessageKind::ClaimedForYou,
+            MessageKind::Claimable,
+            MessageKind::Sent,
+            MessageKind::Claimed,
+            MessageKind::Received,
+        ] {
+            let fr = msg(ALICE, kind).text();
+            let en = Message { lang: Lang::En, ..msg(ALICE, kind) }.text();
+            assert_ne!(fr.title, en.title);
+            assert!(en.body.starts_with("Task #42:"), "{en:?}");
+            assert!(en.body.contains("12.50 CHF"), "{en:?}");
+        }
+    }
 }
