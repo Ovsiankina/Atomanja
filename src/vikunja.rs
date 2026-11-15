@@ -104,7 +104,10 @@ pub trait PageSource {
 ///
 /// [`VikunjaError::Parse`] when the body is not the expected JSON.
 pub fn parse_tasks(json: &str) -> Result<Vec<Task>, VikunjaError> {
-    parse_list::<RawTask>(json)?.into_iter().map(RawTask::into_task).collect()
+    parse_list::<RawTask>(json)?
+        .into_iter()
+        .map(RawTask::into_task)
+        .collect()
 }
 
 /// Parse one page of the project list (APP-3).
@@ -115,7 +118,10 @@ pub fn parse_tasks(json: &str) -> Result<Vec<Task>, VikunjaError> {
 pub fn parse_projects(json: &str) -> Result<Vec<Project>, VikunjaError> {
     Ok(parse_list::<RawProject>(json)?
         .into_iter()
-        .map(|raw| Project { id: raw.id, archived: raw.is_archived })
+        .map(|raw| Project {
+            id: raw.id,
+            archived: raw.is_archived,
+        })
         .collect())
 }
 
@@ -183,8 +189,11 @@ fn parse_date(raw: Option<&str>) -> Result<Option<OffsetDateTime>, VikunjaError>
 /// Set `project_archived` on every task whose project is archived in
 /// `projects` (APP-3). A task whose project is not listed stays `false`.
 pub fn mark_archived(tasks: &mut [Task], projects: &[Project]) {
-    let archived: std::collections::HashSet<i64> =
-        projects.iter().filter(|p| p.archived).map(|p| p.id).collect();
+    let archived: std::collections::HashSet<i64> = projects
+        .iter()
+        .filter(|p| p.archived)
+        .map(|p| p.id)
+        .collect();
     for task in tasks {
         task.project_archived = archived.contains(&task.project_id);
     }
@@ -199,9 +208,38 @@ pub fn mark_archived(tasks: &mut [Task], projects: &[Project]) {
 ///
 /// The first [`VikunjaError`] from any page.
 pub async fn fetch_all<S: PageSource + Sync>(source: &S) -> Result<Vec<Task>, VikunjaError> {
-    let _ = source;
-    todo!()
+    let mut tasks = Vec::new();
+    for body in fetch_pages(source, Resource::Tasks).await? {
+        tasks.extend(parse_tasks(&body)?);
+    }
+    let mut projects = Vec::new();
+    for body in fetch_pages(source, Resource::Projects).await? {
+        projects.extend(parse_projects(&body)?);
+    }
+    mark_archived(&mut tasks, &projects);
+    Ok(tasks)
 }
+
+// DECISION: pages are fetched one after another; page 1 says how many
+// there are. Sequential keeps the load on Vikunja low and makes the
+// first error stop the walk.
+async fn fetch_pages<S: PageSource + Sync>(
+    source: &S,
+    resource: Resource,
+) -> Result<Vec<String>, VikunjaError> {
+    let first = source.page(resource, 1).await?;
+    let total = first.total_pages.max(1);
+    let mut bodies = vec![first.body];
+    for n in 2..=total {
+        bodies.push(source.page(resource, n).await?.body);
+    }
+    Ok(bodies)
+}
+
+// DECISION: 50 per page is Vikunja's default maximum.
+const PER_PAGE: u32 = 50;
+// DECISION: a poll that hangs longer than this counts as unreachable.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The real HTTP page source: Vikunja base URL, bearer token, `GET`
 /// only (APP-1).
@@ -220,8 +258,15 @@ impl Client {
     ///
     /// [`VikunjaError::Transport`] when the HTTP client cannot be built.
     pub fn new(config: &crate::config::Config) -> Result<Client, VikunjaError> {
-        let _ = config;
-        todo!()
+        let http = reqwest::Client::builder()
+            .timeout(TIMEOUT)
+            .build()
+            .map_err(|e| VikunjaError::Transport(e.to_string()))?;
+        Ok(Client {
+            http,
+            base_url: config.vikunja_url.trim_end_matches('/').to_owned(),
+            token: config.vikunja_token.clone(),
+        })
     }
 
     /// The request for page `page` of `resource`: always `GET`, with the
@@ -232,15 +277,52 @@ impl Client {
     ///
     /// [`VikunjaError::Transport`] when the URL cannot be built.
     pub fn request(&self, resource: Resource, page: u32) -> Result<reqwest::Request, VikunjaError> {
-        let _ = (resource, page);
-        todo!()
+        // DECISION: `vikunja_url` is the server root; the API lives under
+        // `/api/v1`. Tasks via `/tasks/all`, projects with
+        // `is_archived=true` so archived ones are listed too (APP-3).
+        let (path, extra): (&str, &[(&str, &str)]) = match resource {
+            Resource::Tasks => ("tasks/all", &[]),
+            Resource::Projects => ("projects", &[("is_archived", "true")]),
+        };
+        // DECISION: the query is built on `Url` directly; `RequestBuilder::query`
+        // needs a reqwest feature this crate does not enable.
+        let mut url = reqwest::Url::parse(&format!("{}/api/v1/{path}", self.base_url))
+            .map_err(|e| VikunjaError::Transport(format!("bad vikunja url: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("page", &page.to_string())
+            .append_pair("per_page", &PER_PAGE.to_string())
+            .extend_pairs(extra);
+        self.http
+            .get(url)
+            .bearer_auth(&self.token)
+            .build()
+            .map_err(|e| VikunjaError::Transport(e.to_string()))
     }
 }
 
 impl PageSource for Client {
     async fn page(&self, resource: Resource, page: u32) -> Result<Page, VikunjaError> {
-        let _ = (resource, page);
-        todo!()
+        let request = self.request(resource, page)?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|e| VikunjaError::Transport(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(VikunjaError::Status(status.as_u16()));
+        }
+        let total_pages = response
+            .headers()
+            .get("x-pagination-total-pages")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        let body = response
+            .text()
+            .await
+            .map_err(|e| VikunjaError::Transport(e.to_string()))?;
+        Ok(Page { body, total_pages })
     }
 }
 
@@ -257,8 +339,10 @@ pub enum VikunjaError {
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = (f, &self.http, &self.base_url, &self.token);
-        todo!()
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -308,7 +392,10 @@ mod tests {
     fn app_3_maps_due_date_utc() {
         let task = one(&task_json(""));
         assert_eq!(task.due, Some(utc(2026, 12, 1, 8, 0)));
-        assert_eq!(task.due.map(OffsetDateTime::offset), Some(time::UtcOffset::UTC));
+        assert_eq!(
+            task.due.map(OffsetDateTime::offset),
+            Some(time::UtcOffset::UTC)
+        );
         assert_eq!(task.id, 42);
         assert_eq!(task.project_id, 7);
         assert_eq!(task.title, "Pay rent");
@@ -354,13 +441,30 @@ mod tests {
         .expect("fixture parses");
         assert_eq!(
             projects,
-            vec![Project { id: 7, archived: true }, Project { id: 8, archived: false }]
+            vec![
+                Project {
+                    id: 7,
+                    archived: true
+                },
+                Project {
+                    id: 8,
+                    archived: false
+                }
+            ]
         );
         let base = one(&task_json(""));
         let mut tasks = vec![
             base.clone(),
-            Task { id: 43, project_id: 8, ..base.clone() },
-            Task { id: 44, project_id: 99, ..base },
+            Task {
+                id: 43,
+                project_id: 8,
+                ..base.clone()
+            },
+            Task {
+                id: 44,
+                project_id: 99,
+                ..base
+            },
         ];
         mark_archived(&mut tasks, &projects);
         let flags: Vec<bool> = tasks.iter().map(|t| t.project_archived).collect();
@@ -374,7 +478,7 @@ mod tests {
             dev_db: "dev.db".into(),
             vikunja_url: url.to_owned(),
             vikunja_token: token.to_owned(),
-            poll_interval: std::time::Duration::from_secs(300),
+            poll_interval: std::time::Duration::from_mins(5),
             base_url: "https://atomanja.example".to_owned(),
             smtp: crate::config::Smtp {
                 host: "smtp.example".to_owned(),
@@ -394,18 +498,28 @@ mod tests {
                 let req = client.request(resource, page).expect("request");
                 assert_eq!(req.method(), reqwest::Method::GET);
                 assert_eq!(
-                    req.headers().get(reqwest::header::AUTHORIZATION).and_then(|v| v.to_str().ok()),
+                    req.headers()
+                        .get(reqwest::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok()),
                     Some("Bearer s3cret")
                 );
                 assert!(req.body().is_none());
                 let url = req.url();
                 assert_eq!(url.host_str(), Some("vikunja.example"));
                 assert!(url.path().starts_with("/api/v1/"), "{url}");
-                assert!(url.query_pairs().any(|(k, v)| k == "page" && v == page.to_string()));
+                assert!(
+                    url.query_pairs()
+                        .any(|(k, v)| k == "page" && v == page.to_string())
+                );
             }
         }
         let projects = client.request(Resource::Projects, 1).expect("request");
-        assert!(projects.url().query_pairs().any(|(k, v)| k == "is_archived" && v == "true"));
+        assert!(
+            projects
+                .url()
+                .query_pairs()
+                .any(|(k, v)| k == "is_archived" && v == "true")
+        );
     }
 
     struct FakeSource {
@@ -421,19 +535,30 @@ mod tests {
         }
     }
 
-    fn page(body: &str, total_pages: u32) -> Result<Page, VikunjaError> {
-        Ok(Page { body: body.to_owned(), total_pages })
+    fn page(body: &str, total_pages: u32) -> Page {
+        Page {
+            body: body.to_owned(),
+            total_pages,
+        }
     }
 
     fn healthy() -> FakeSource {
         let t1 = task_json("");
-        let t2 = task_json("").replace(r#""id":42"#, r#""id":43"#).replace(r#""project_id":7"#, r#""project_id":8"#);
+        let t2 = task_json("")
+            .replace(r#""id":42"#, r#""id":43"#)
+            .replace(r#""project_id":7"#, r#""project_id":8"#);
         FakeSource {
             pages: [
-                ((Resource::Tasks, 1), page(&t1, 2)),
-                ((Resource::Tasks, 2), page(&t2, 2)),
-                ((Resource::Projects, 1), page(r#"[{"id":7,"is_archived":true}]"#, 2)),
-                ((Resource::Projects, 2), page(r#"[{"id":8,"is_archived":false}]"#, 2)),
+                ((Resource::Tasks, 1), Ok(page(&t1, 2))),
+                ((Resource::Tasks, 2), Ok(page(&t2, 2))),
+                (
+                    (Resource::Projects, 1),
+                    Ok(page(r#"[{"id":7,"is_archived":true}]"#, 2)),
+                ),
+                (
+                    (Resource::Projects, 2),
+                    Ok(page(r#"[{"id":8,"is_archived":false}]"#, 2)),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -447,14 +572,20 @@ mod tests {
         assert_eq!(got, vec![(42, true), (43, false)]);
 
         let failures = [
-            ((Resource::Tasks, 2), Err(VikunjaError::Transport("timeout".to_owned()))),
+            (
+                (Resource::Tasks, 2),
+                Err(VikunjaError::Transport("timeout".to_owned())),
+            ),
             ((Resource::Projects, 2), Err(VikunjaError::Status(500))),
-            ((Resource::Tasks, 2), page("{broken", 2)),
+            ((Resource::Tasks, 2), Ok(page("{broken", 2))),
         ];
         for (key, failure) in failures {
             let mut source = healthy();
             source.pages.insert(key, failure);
-            assert!(fetch_all(&source).await.is_err(), "{key:?} must fail the fetch");
+            assert!(
+                fetch_all(&source).await.is_err(),
+                "{key:?} must fail the fetch"
+            );
         }
     }
 
