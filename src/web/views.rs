@@ -11,7 +11,7 @@ use maud::{html, Markup};
 use super::i18n::Msgs;
 use super::pages::{self, Status, Variant};
 use crate::auth::{Account, Role};
-use crate::ledger::{DebtId, EventKind, Ledger, Outcome, TaskId, Timestamp, WitnessId};
+use crate::ledger::{DebtId, EventKind, Ledger, OccurrenceId, Outcome, TaskId, Timestamp, WitnessId};
 
 /// Who looks at the rows; decides titles and which button a row gets.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,6 +113,9 @@ pub(super) fn debt_by_occurrence(ledger: &Ledger) -> Vec<Option<usize>> {
 fn status(ledger: &Ledger, o: usize, d: Option<usize>) -> Status {
     let debts = ledger.debts();
     match (ledger.occurrences().outcome[o], d) {
+        (Outcome::Pending, _) if u32::try_from(o).is_ok_and(|o| ledger.seen_done(OccurrenceId(o))) => {
+            Status::Done
+        }
         (Outcome::Pending, _) => Status::Upcoming,
         (Outcome::Met, _) => Status::Met,
         (Outcome::Late, Some(d)) if debts.received_at[d].is_some() => Status::Received,
@@ -121,13 +124,16 @@ fn status(ledger: &Ledger, o: usize, d: Option<usize>) -> Status {
     }
 }
 
-/// Late first, then sent, upcoming, settled; by deadline inside each.
+// DECISION: a task done before its deadline sinks to the very bottom,
+// below the settled ones: nothing is left to do on it.
+/// Late first, then sent, upcoming, settled, done; by deadline inside each.
 fn rank(s: Status) -> u8 {
     match s {
         Status::Late => 0,
         Status::Sent => 1,
         Status::Upcoming => 2,
         Status::Met | Status::Received => 3,
+        Status::Done => 4,
     }
 }
 
@@ -424,8 +430,10 @@ fn table(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
 // DECISION: the design system's board has four fixed columns; met tasks
 // (done in time, no debt) have no debt state, so they get a fifth "Met"
 // column at the end instead of disappearing from the board, as Vikunja's
-// board keeps a Done column. The grid is widened to five inline.
-/// `Kanban`: Upcoming, Late, Sent, Confirmed, then Met.
+// board keeps a Done column. The grid is widened to five inline. Tasks
+// done before their deadline wait in that same column, after the met
+// ones (the items are already sorted that way).
+/// `Kanban`: Upcoming, Late, Sent, Confirmed, then Met and Done.
 fn kanban(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
     let m = ctx.m;
     let cols = [
@@ -438,7 +446,7 @@ fn kanban(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
     html! {
         div.at-kanban style="grid-template-columns:repeat(5,minmax(232px,1fr))" {
             @for (n, (st, class, title)) in cols.into_iter().enumerate() {
-                @let col: Vec<&Item> = items.iter().filter(|i| i.st == st).collect();
+                @let col: Vec<&Item> = items.iter().filter(|i| i.st == st || (st == Status::Met && i.st == Status::Done)).collect();
                 section class={ "at-col at-col--" (class) } {
                     header.at-col__head {
                         span.at-label { span.at-index { "/0." (n + 1) } " " (title) }
@@ -454,6 +462,7 @@ fn kanban(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
                                 @if let Some(d) = i.d { span.at-mono { (money(m, ledger, d)) } }
                             }
                             div.at-card__title { (label(ctx, i.task)) }
+                            @if i.st == Status::Done { div { (pages::tag(i.st.class(), i.st.word(m))) } }
                             @if let Some(d) = i.d {
                                 div.at-card__meta {
                                     span.at-muted { (owner_text(ctx, ledger.debts().owner[d])) }
@@ -557,6 +566,7 @@ fn gantt(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
                     @let over = i.st == Status::Late && now > d + 1.0;
                     @let note = match (i.st, i.d) {
                         (Status::Upcoming, _) => m.date(i.deadline),
+                        (Status::Done, _) => format!("{} · {}", i.st.word(m), m.date(i.deadline)),
                         (_, Some(dd)) => format!("{} · {}", i.st.word(m), money(m, ledger, dd)),
                         (st, None) => st.word(m).to_owned(),
                     };

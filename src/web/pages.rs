@@ -145,6 +145,8 @@ impl<'a> Field<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Status {
     Upcoming,
+    /// Pending, but the last poll saw it done: waits for its deadline.
+    Done,
     Met,
     Late,
     Sent,
@@ -156,6 +158,7 @@ impl Status {
     pub fn class(self) -> &'static str {
         match self {
             Status::Upcoming => "upcoming",
+            Status::Done => "done",
             Status::Met => "neutral",
             Status::Late => "late",
             Status::Sent => "sent",
@@ -167,6 +170,7 @@ impl Status {
     pub fn word(self, m: &Msgs) -> &'static str {
         match self {
             Status::Upcoming => m.st_upcoming,
+            Status::Done => m.st_done,
             Status::Met => m.st_met,
             Status::Late => m.st_late,
             Status::Sent => m.st_sent,

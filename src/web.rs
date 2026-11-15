@@ -468,7 +468,8 @@ mod tests {
 
     /// Worker, witnesses a and b, and one row of every kind, with titles:
     /// #47 received, #48 sent, #49 unclaimed, #50 met, #51 upcoming with
-    /// a moved deadline, #52 claimed by a and not sent.
+    /// a moved deadline, #52 claimed by a and not sent, #53 done before
+    /// its deadline (three days after the others).
     fn rich_ledger(h: &Harness) -> People {
         use crate::ledger::{Change, EventKind, OccurrenceId, Outcome, TaskId, Timestamp};
         let t = testkit::DEADLINE;
@@ -490,10 +491,15 @@ mod tests {
             ])
             .unwrap();
             testkit::late_debt(s, 52, Some(a.id.0));
+            s.append(&[
+                Change::Recorded { occurrence: OccurrenceId(6), task: TaskId(53), deadline: Timestamp(t + 3 * 86_400), at: Timestamp(t - 9000) },
+                Change::SeenDone { occurrence: OccurrenceId(6), done: true, at: Timestamp(t - 3600) },
+            ])
+            .unwrap();
             People { worker, a, b }
         })
         .tap(|_| {
-            for (n, title) in [(47, "Pay rent"), (48, "Write report"), (49, "Call dentist"), (50, "Water plants"), (51, "File taxes"), (52, "Fix bike")] {
+            for (n, title) in [(47, "Pay rent"), (48, "Write report"), (49, "Call dentist"), (50, "Water plants"), (51, "File taxes"), (52, "Fix bike"), (53, "Clean desk")] {
                 h.title(n, title);
             }
         })
@@ -552,7 +558,7 @@ mod tests {
     }
 
     // web-05
-    const TITLES: [&str; 6] = ["Pay rent", "Write report", "Call dentist", "Water plants", "File taxes", "Fix bike"];
+    const TITLES: [&str; 7] = ["Pay rent", "Write report", "Call dentist", "Water plants", "File taxes", "Fix bike", "Clean desk"];
 
     #[tokio::test]
     async fn app_32_witness_view_never_contains_task_title() {
@@ -634,6 +640,36 @@ mod tests {
         // Table: No., Task, Deadline… headers for the worker.
         let table = h.get("/?view=table", Some(&cw)).await.body;
         assert!(table.contains(">Tâche<") && table.contains(">Échéance<"));
+    }
+
+    #[tokio::test]
+    async fn done_before_deadline_shows_done_in_every_view() {
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let cw = h.ledger(|s| testkit::session(s, &p.worker));
+        // List: tagged done, and last of all rows.
+        let list = h.get("/?view=list", Some(&cw)).await.body;
+        assert!(list.contains(r#"class="at-row at-row--done" id="occ-6""#), "{list}");
+        assert!(list.contains("at-tag at-tag--done") && list.contains(">Fait<"), "{list}");
+        let last_row = list.rfind(r#"class="at-row "#).unwrap();
+        assert!(list[last_row..].contains(r#"id="occ-6""#), "done sinks to the bottom: {list}");
+        // Gantt: the hatched done row, also last.
+        let gantt = h.get("/?view=gantt", Some(&cw)).await.body;
+        assert!(gantt.contains(r#"at-gantt__row at-gantt__row--done" id="occ-6""#), "{gantt}");
+        let last_bar = gantt.rfind("at-gantt__row at-gantt__row--").unwrap();
+        assert!(gantt[last_bar..].contains(r#"id="occ-6""#));
+        let css = h.get("/assets/app.css", None).await.body;
+        assert!(css.contains(".at-gantt__row--done .at-gantt__bar"), "striped bar styled");
+        // Kanban: in the met (done) column, after the met card.
+        let board = h.get("/?view=kanban", Some(&cw)).await.body;
+        let met_col = board.find("at-col--met").unwrap();
+        let done_card = board.find(r#"id="occ-6""#).unwrap();
+        assert!(done_card > met_col, "done card in the met column: {board}");
+        assert!(board[met_col..].find(r#"id="occ-3""#).unwrap() < done_card - met_col, "met first");
+        // A witness sees it done too, without the title.
+        let ca = h.ledger(|s| testkit::session(s, &p.a));
+        let wl = h.get("/?view=list", Some(&ca)).await.body;
+        assert!(wl.contains("at-row--done") && !wl.contains("Clean desk"));
     }
 
     #[tokio::test]

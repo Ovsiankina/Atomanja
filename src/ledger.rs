@@ -925,6 +925,14 @@ impl Ledger {
     pub fn debts(&self) -> &DebtTable {
         &self.debts
     }
+
+    /// Whether the last poll before the deadline saw `occurrence`'s task
+    /// done, so the views can show it done while it waits for its APP-9
+    /// decision. `false` for an unknown occurrence.
+    pub fn seen_done(&self, occurrence: OccurrenceId) -> bool {
+        let i = occurrence.0 as usize;
+        i < self.tracking.seen_done.len() && self.seen_done_last(i)
+    }
 }
 
 #[cfg(test)]
@@ -1337,6 +1345,19 @@ mod tests {
                 (OccurrenceId(1), Outcome::Late, t(DAY + 20)),
             ]
         );
+    }
+
+    #[test]
+    fn seen_done_follows_the_last_poll_before_the_deadline() {
+        let mut l = Ledger::new();
+        assert!(!l.seen_done(OccurrenceId(0)), "unknown occurrence");
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        assert!(!l.seen_done(OccurrenceId(0)), "open");
+        poll(&mut l, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
+        assert!(l.seen_done(OccurrenceId(0)), "marked done, still pending");
+        assert_eq!(l.occurrences().outcome[0], Outcome::Pending);
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 20, &[]);
+        assert!(!l.seen_done(OccurrenceId(0)), "reopened");
     }
 
     #[test]

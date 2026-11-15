@@ -25,3 +25,17 @@ html,body{margin:0;background:var(--bg)}
   .page{padding:var(--space-12)}
   .page__mark{font-size:56px}
 }
+/* Gantt colours, per the design system's README: status marks are
+   hollow for upcoming and filled for every other state. Met has no
+   money, so no status colour: it fills in `ink-muted` (bundle.css left it
+   hollow, identical to upcoming). */
+.at-gantt__row--neutral .at-gantt__dot,.at-gantt__row--neutral .at-gantt__bar{border-color:var(--ink-muted);background:var(--ink-muted)}
+/* Done before its deadline (not in the vendored design system): no money
+   is involved, so no status colour. `ink` with a ✓-filled mark, and on the
+   Gantt the planned span is hatched in `ink-muted`, the same texture as
+   the late overrun but neutral. */
+.at-tag--done{color:var(--ink)}
+.at-gantt__row--done .at-gantt__dot{border-color:var(--ink-muted);background:var(--ink-muted)}
+.at-gantt__row--done .at-gantt__bar{border-color:var(--ink-muted);background:repeating-linear-gradient(135deg,var(--ink-muted) 0 2px,transparent 2px 6px)}
+.at-gantt__row--done .at-gantt__title{color:var(--ink-muted)}
+.at-row--done .at-row__title{color:var(--ink-muted)}
