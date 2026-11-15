@@ -398,6 +398,9 @@ impl Batch {
         let occurrence = OccurrenceId(self.next_occ);
         self.next_occ += 1;
         self.out.push(Change::Recorded { occurrence, task: o.task, deadline, at: now });
+        if o.done {
+            self.out.push(Change::SeenDone { occurrence, done: true, at: now });
+        }
     }
 }
 
@@ -437,11 +440,18 @@ impl Ledger {
                     (_, None) => Seen::NoDue,
                     (_, Some(d)) => Seen::Due(d),
                 };
-                if kind == EventKind::MovedEarlier {
+                // DECISION: a decided occurrence keeps its deadline; only a
+                // pending one follows an earlier due date (APP-7, APP-10).
+                if kind == EventKind::MovedEarlier
+                    && self.occurrences.outcome[i] == Outcome::Pending
+                {
                     if let Some(d) = new_due {
                         self.occurrences.deadline[i] = d;
                     }
                 }
+            }
+            Change::SeenDone { occurrence, done, .. } => {
+                self.tracking.seen_done[idx(occurrence.0)] = done;
             }
             Change::Decided { occurrence, outcome, .. } => {
                 self.occurrences.outcome[idx(occurrence.0)] = outcome;
@@ -534,6 +544,10 @@ impl Ledger {
                 return;
             }
         }
+        let pending = self.occurrences.outcome[i] == Outcome::Pending;
+        let mut deadline = recorded;
+        let mut seen_done = self.tracking.seen_done[i];
+        let visible = o.filter(|o| !o.archived);
         if changed {
             let (kind, new_due) = match seen {
                 Seen::Gone => (EventKind::Deleted, None),
@@ -545,8 +559,31 @@ impl Ledger {
                 Seen::Due(d) if d < recorded => (EventKind::MovedEarlier, Some(d)),
                 Seen::Due(d) => (EventKind::MovedLater, Some(d)),
             };
+            if kind == EventKind::MovedEarlier && pending {
+                deadline = new_due.unwrap_or(recorded);
+            }
             batch.out.push(Change::Event { occurrence: occ, kind, new_due, at: now });
         }
+        if !pending {
+            return;
+        }
+        if now <= deadline {
+            // DECISION: a task that vanished or was archived shows no done
+            // flag, so the last one seen before it went is kept (APP-9).
+            if let Some(o) = visible {
+                if o.done != seen_done {
+                    seen_done = o.done;
+                    batch.out.push(Change::SeenDone { occurrence: occ, done: o.done, at: now });
+                }
+            }
+            return;
+        }
+        // First successful poll after the deadline (APP-9).
+        // DECISION: `done` without a `done_at` proves nothing about when;
+        // Vikunja always stamps it, so this only guards odd data.
+        let done_in_time =
+            visible.is_some_and(|o| o.done && o.done_at.is_some_and(|d| d <= deadline));
+        batch.decide(occ, done_in_time || seen_done, now);
     }
 
     /// A real witness claims an unclaimed debt (APP-18, APP-19, APP-20).
@@ -953,12 +990,122 @@ mod tests {
     }
 
     // ledger-04
-    #[test] fn app_9_done_before_deadline_is_met() { todo!() }
-    #[test] fn app_9_done_after_deadline_is_late() { todo!() }
-    #[test] fn app_9_seen_done_then_reopened_after_deadline_is_met() { todo!() }
-    #[test] fn app_9_deleted_never_seen_done_is_late() { todo!() }
-    #[test] fn app_9_decided_on_first_poll_after_deadline_even_if_late_poll() { todo!() }
-    #[test] fn app_10_decision_never_revised() { todo!() }
+    fn decisions(changes: &[Change]) -> Vec<(OccurrenceId, Outcome, Timestamp)> {
+        changes
+            .iter()
+            .filter_map(|c| match *c {
+                Change::Decided { occurrence, outcome, at } => Some((occurrence, outcome, at)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn app_9_done_before_deadline_is_met() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let c = poll(&mut l, &snap(vec![done(obs(1, Some(DAY)), DAY - 10)]), DAY + 1, &[]);
+        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+        assert_eq!(l.occurrences().outcome, vec![Outcome::Met]);
+        assert!(l.debts().occurrence.is_empty());
+    }
+
+    #[test]
+    fn app_9_done_after_deadline_is_late() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY)), obs(2, Some(DAY))]), 0, &[]);
+        let s = snap(vec![done(obs(1, Some(DAY)), DAY + 10), obs(2, Some(DAY))]);
+        let c = poll(&mut l, &s, DAY + 20, &[]);
+        assert_eq!(
+            decisions(&c),
+            vec![
+                (OccurrenceId(0), Outcome::Late, t(DAY + 20)),
+                (OccurrenceId(1), Outcome::Late, t(DAY + 20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn app_9_seen_done_then_reopened_after_deadline_is_met() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let c = poll(&mut l, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
+        assert_eq!(
+            c,
+            vec![Change::SeenDone { occurrence: OccurrenceId(0), done: true, at: t(10) }]
+        );
+        let c = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY + 1, &[]);
+        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+
+        // Seen done, then reopened before the deadline: the last
+        // observation before the deadline is "open", so late.
+        let mut m = Ledger::new();
+        poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
+        let c = poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 20, &[]);
+        assert_eq!(
+            c,
+            vec![Change::SeenDone { occurrence: OccurrenceId(0), done: false, at: t(20) }]
+        );
+        let c = poll(&mut m, &snap(vec![obs(1, Some(DAY))]), DAY + 1, &[]);
+        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Late, t(DAY + 1))]);
+    }
+
+    #[test]
+    fn app_9_deleted_never_seen_done_is_late() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let c = poll(&mut l, &snap(vec![]), DAY + 1, &[]);
+        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Late, t(DAY + 1))]);
+        assert_eq!(l.events().kind, vec![EventKind::Deleted]);
+
+        // Deleted after being seen done before the deadline: met.
+        let mut m = Ledger::new();
+        poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
+        poll(&mut m, &snap(vec![]), 20, &[]);
+        let c = poll(&mut m, &snap(vec![]), DAY + 1, &[]);
+        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+
+        // First seen already done, then deleted: the first sight counts as
+        // an observation before the deadline.
+        let mut f = Ledger::new();
+        poll(&mut f, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
+        let c = poll(&mut f, &snap(vec![]), DAY + 1, &[]);
+        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+    }
+
+    #[test]
+    fn app_9_decided_on_first_poll_after_deadline_even_if_late_poll() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        // At the deadline itself: not yet past.
+        assert!(poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY, &[]).is_empty());
+        // Next successful poll is ten days later (server or Vikunja down).
+        let c = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 10 * DAY, &[]);
+        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Late, t(10 * DAY))]);
+    }
+
+    #[test]
+    fn app_10_decision_never_revised() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY + 1, &[]);
+        assert_eq!(l.occurrences().outcome, vec![Outcome::Late]);
+        // Vikunja later claims it was done before the deadline.
+        let c = poll(&mut l, &snap(vec![done(obs(1, Some(DAY)), DAY - 1)]), DAY + 2, &[]);
+        assert!(decisions(&c).is_empty());
+        assert!(!c.iter().any(|c| matches!(c, Change::SeenDone { .. })));
+        assert_eq!(l.occurrences().outcome, vec![Outcome::Late]);
+        // And a met one stays met when reopened and moved.
+        let mut m = Ledger::new();
+        poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), DAY + 1, &[]);
+        let c = poll(&mut m, &snap(vec![obs(1, Some(DAY - 5))]), DAY + 2, &[]);
+        assert!(decisions(&c).is_empty());
+        assert_eq!(m.occurrences().outcome, vec![Outcome::Met]);
+        assert_eq!(m.occurrences().deadline, vec![t(DAY)]);
+    }
 
     // ledger-05
     #[test] fn app_11_late_creates_one_debt_with_amount_in_force() { todo!() }
