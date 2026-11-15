@@ -48,6 +48,13 @@ use crate::mail::Mailer;
 use crate::notify::Notifier;
 use crate::store::{DevDb, LedgerDb, Store};
 
+mod actions;
+mod handlers;
+mod i18n;
+mod pages;
+mod session;
+mod views;
+
 /// Everything the handlers share. Cheap to clone (all `Arc` or
 /// already-shared handles). The CLI builds it once and hands the same
 /// `ledger` and `titles` to `sync::run`.
@@ -76,8 +83,13 @@ pub struct AppState {
 /// and static assets. SRS: APP-16, APP-18, APP-21, APP-22, APP-26..APP-33,
 /// APP-38..APP-40, DEV-3.
 pub fn router(state: AppState) -> axum::Router {
-    let _state = state;
-    todo!()
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/", get(handlers::index))
+        .route("/login", get(handlers::login_form).post(handlers::login))
+        .route("/logout", post(handlers::logout))
+        .route("/debts/{id}/claim", post(actions::claim))
+        .with_state(state)
 }
 
 // DECISION: binds with tokio::net::TcpListener + axum::serve; tokio's `net`
@@ -90,8 +102,12 @@ pub fn router(state: AppState) -> axum::Router {
 /// [`WebError::Bind`] when `addr` cannot be bound, [`WebError::Serve`]
 /// when the server stops with an I/O error.
 pub async fn serve(state: AppState, addr: SocketAddr) -> Result<(), WebError> {
-    let _ = (state, addr);
-    todo!()
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(WebError::Bind)?;
+    axum::serve(listener, router(state))
+        .await
+        .map_err(WebError::Serve)
 }
 
 /// Why the server could not start or stopped.
@@ -105,23 +121,136 @@ pub enum WebError {
 
 impl std::fmt::Display for WebError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        match self {
+            WebError::Bind(e) => write!(f, "cannot bind the listen address: {e}"),
+            WebError::Serve(e) => write!(f, "web server stopped: {e}"),
+        }
     }
 }
 
 impl std::error::Error for WebError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        todo!()
+        match self {
+            WebError::Bind(e) | WebError::Serve(e) => Some(e),
+        }
     }
 }
 
 #[cfg(test)]
+mod testkit;
+
+#[cfg(test)]
 mod tests {
+    use super::testkit::{self, Harness};
+    use crate::auth::{Role, Token, TokenKind};
+
     // web-01
-    #[test] fn web_login_sets_session() { todo!() }
-    #[test] fn web_wrong_password_rejected() { todo!() }
-    #[test] fn dev_3_admin_requests_use_dev_store() { todo!() }
+    #[tokio::test]
+    async fn web_login_sets_session() {
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| {
+            testkit::account_with_password(s, "worker@atomanja.test", "correct horse", Role::Worker)
+        });
+        let r = h
+            .post(
+                "/login",
+                None,
+                &[("email", "worker@atomanja.test"), ("password", "correct horse")],
+            )
+            .await;
+        assert_eq!(r.status, 303, "{}", r.body);
+        assert_eq!(r.location(), Some("/"));
+        let cookie = r.session_cookie().expect("session cookie set");
+        let set = r.headers.get("set-cookie").unwrap().to_str().unwrap().to_owned();
+        assert!(set.contains("HttpOnly"), "{set}");
+        assert!(set.contains("SameSite=Lax"), "{set}");
+        let stored = h.ledger(|s| s.token(&Token(cookie.clone())).unwrap()).expect("stored");
+        assert_eq!(stored.kind, TokenKind::Session);
+        assert_eq!(stored.account, Some(worker.id));
+
+        let page = h.get("/", Some(&cookie)).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains(r#"data-view="worker""#), "{}", page.body);
+
+        let out = h.post("/logout", Some(&cookie), &[]).await;
+        assert_eq!(out.status, 303);
+        let after = h.get("/", Some(&cookie)).await;
+        assert_eq!(after.status, 303, "logged-out session no longer works");
+        assert_eq!(after.location(), Some("/login"));
+    }
+
+    #[tokio::test]
+    async fn web_wrong_password_rejected() {
+        let h = Harness::start().await;
+        h.ledger(|s| {
+            testkit::account_with_password(s, "worker@atomanja.test", "correct horse", Role::Worker)
+        });
+        for (email, password) in [
+            ("worker@atomanja.test", "wrong horse"),
+            ("nobody@atomanja.test", "correct horse"),
+        ] {
+            let r = h.post("/login", None, &[("email", email), ("password", password)]).await;
+            assert_eq!(r.status, 401, "{}", r.body);
+            assert!(r.session_cookie().is_none());
+            assert!(r.body.contains("Adresse ou mot de passe incorrect"), "{}", r.body);
+        }
+        let anon = h.get("/", None).await;
+        assert_eq!(anon.status, 303);
+        assert_eq!(anon.location(), Some("/login"));
+        let forged = h.get("/", Some("forged-token")).await;
+        assert_eq!(forged.status, 303);
+    }
+
+    #[tokio::test]
+    async fn dev_3_admin_requests_use_dev_store() {
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| testkit::account(s, "worker@atomanja.test", Role::Worker));
+        h.ledger(|s| testkit::late_debt(s, 47, None));
+        h.title(47, "Real secret title");
+        h.dev(|s| {
+            testkit::account_with_password(s, "admin@atomanja.test", "admin password", Role::Admin)
+        });
+        h.dev(|s| testkit::late_debt(s, 901, None));
+
+        let r = h
+            .post(
+                "/login",
+                None,
+                &[("email", "admin@atomanja.test"), ("password", "admin password")],
+            )
+            .await;
+        assert_eq!(r.status, 303, "{}", r.body);
+        let cookie = r.session_cookie().expect("admin session");
+        assert!(h.dev(|s| s.token(&Token(cookie.clone())).unwrap()).is_some());
+        assert!(h.ledger(|s| s.token(&Token(cookie.clone())).unwrap()).is_none());
+
+        let page = h.get("/", Some(&cookie)).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains(r#"data-view="witness""#), "{}", page.body);
+        assert!(page.body.contains("Tâche 901"), "{}", page.body);
+        assert!(!page.body.contains("Tâche 47"), "{}", page.body);
+        assert!(!page.body.contains("Real secret title"));
+        assert!(page.body.contains("at-banner--fake"), "admin view carries the fake banner");
+
+        // The admin cannot act, and nothing reaches the ledger file.
+        let before = h.ledger(|s| s.load_changes().unwrap().len());
+        let claim = h.post("/debts/0/claim", Some(&cookie), &[]).await;
+        assert_eq!(claim.status, 403);
+        assert_eq!(h.ledger(|s| s.load_changes().unwrap().len()), before);
+
+        // A dev-file account that is not the admin never logs in (DEV-3).
+        h.dev(|s| testkit::account_with_password(s, "fake@atomanja.test", "fake password", Role::Witness));
+        let fake = h
+            .post("/login", None, &[("email", "fake@atomanja.test"), ("password", "fake password")])
+            .await;
+        assert_eq!(fake.status, 401);
+
+        // The worker sees the ledger, never the dev data.
+        let wc = h.ledger(|s| testkit::session(s, &worker));
+        let wp = h.get("/", Some(&wc)).await;
+        assert!(wp.body.contains("Real secret title"), "{}", wp.body);
+        assert!(!wp.body.contains("901"));
+    }
 
     // web-02
     #[test] fn app_26_worker_creates_invite_link_shown_and_mailed() { todo!() }
