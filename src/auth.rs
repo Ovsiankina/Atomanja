@@ -8,6 +8,7 @@
 //! whether an account may act, and which database its requests go to.
 
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use rand::TryRng;
 use time::{Duration, OffsetDateTime};
 
 /// Account id, as stored. A witness's id is also its
@@ -111,12 +112,16 @@ pub enum TokenKind {
 impl TokenKind {
     /// How long a token of this kind stays valid after it is issued.
     pub fn lifetime(self) -> Duration {
-        todo!()
+        match self {
+            TokenKind::Invite => Duration::days(7),
+            TokenKind::Reset => Duration::hours(1),
+            TokenKind::Session => Duration::days(30),
+        }
     }
 
     /// `true` for invite and reset tokens (APP-26, APP-28).
     pub fn single_use(self) -> bool {
-        todo!()
+        matches!(self, TokenKind::Invite | TokenKind::Reset)
     }
 }
 
@@ -126,9 +131,40 @@ pub struct Token(pub String);
 
 impl Token {
     /// A fresh unguessable token (Review Focus 5).
+    ///
+    /// # Panics
+    ///
+    /// If the OS RNG fails. A weak token is never returned instead.
     pub fn generate() -> Token {
-        todo!()
+        let mut bytes = [0u8; TOKEN_BYTES];
+        // DECISION: read straight from the OS RNG (SysRng) as the contract
+        // says, and panic on failure rather than fall back to anything weaker.
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OS random number generator failed");
+        Token(base64url(&bytes))
     }
+}
+
+/// Random bytes per token (Review Focus 5: at least 32).
+const TOKEN_BYTES: usize = 32;
+
+/// Unpadded base64url (RFC 4648 section 5) of `bytes`.
+// DECISION: hand-rolled, about 15 lines, instead of adding a base64 crate.
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        // 1 input byte gives 2 chars, 2 give 3, 3 give 4.
+        for i in 0..=chunk.len() {
+            let idx = (n >> (18 - 6 * i)) & 0x3f;
+            out.push(char::from(ALPHABET[idx as usize]));
+        }
+    }
+    out
 }
 
 /// A stored token row, as `store` loads it.
@@ -154,8 +190,15 @@ impl IssuedToken {
     ///
     /// `AlreadyUsed`, `Expired`.
     pub fn check(&self, now: OffsetDateTime) -> Result<(), AuthError> {
-        let _ = now;
-        todo!()
+        if self.used {
+            return Err(AuthError::AlreadyUsed);
+        }
+        // DECISION: valid on [issued_at, issued_at + lifetime); the exact
+        // end instant is already expired.
+        if now >= self.issued_at + self.kind.lifetime() {
+            return Err(AuthError::Expired);
+        }
+        Ok(())
     }
 }
 
@@ -227,8 +270,7 @@ impl std::fmt::Debug for PasswordHash {
 
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        f.write_str("Token(<redacted>)")
     }
 }
 
@@ -296,11 +338,90 @@ mod tests {
     }
 
     // auth-03
-    #[test] fn app_26_invite_single_use() { todo!() }
-    #[test] fn app_26_invite_expires_after_7_days() { todo!() }
-    #[test] fn app_28_reset_single_use() { todo!() }
-    #[test] fn app_28_reset_expires_after_1_hour() { todo!() }
-    #[test] fn auth_tokens_are_unique_and_unguessable_length() { todo!() }
+    fn t0() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    fn issued(kind: TokenKind, used: bool) -> IssuedToken {
+        IssuedToken {
+            token: Token::generate(),
+            kind,
+            account: match kind {
+                TokenKind::Invite => None,
+                _ => Some(AccountId(1)),
+            },
+            issued_at: t0(),
+            used,
+        }
+    }
+
+    #[test]
+    fn app_26_invite_single_use() {
+        assert!(TokenKind::Invite.single_use());
+        assert_eq!(issued(TokenKind::Invite, false).check(t0()), Ok(()));
+        assert_eq!(
+            issued(TokenKind::Invite, true).check(t0()),
+            Err(AuthError::AlreadyUsed)
+        );
+    }
+
+    #[test]
+    fn app_26_invite_expires_after_7_days() {
+        assert_eq!(TokenKind::Invite.lifetime(), Duration::days(7));
+        let tok = issued(TokenKind::Invite, false);
+        let edge = t0() + Duration::days(7);
+        assert_eq!(tok.check(edge - Duration::seconds(1)), Ok(()));
+        assert_eq!(tok.check(edge), Err(AuthError::Expired));
+        assert_eq!(tok.check(edge + Duration::days(1)), Err(AuthError::Expired));
+    }
+
+    #[test]
+    fn app_28_reset_single_use() {
+        assert!(TokenKind::Reset.single_use());
+        assert!(!TokenKind::Session.single_use());
+        assert_eq!(issued(TokenKind::Reset, false).check(t0()), Ok(()));
+        assert_eq!(
+            issued(TokenKind::Reset, true).check(t0()),
+            Err(AuthError::AlreadyUsed)
+        );
+        // A logged-out session is refused too.
+        assert_eq!(
+            issued(TokenKind::Session, true).check(t0()),
+            Err(AuthError::AlreadyUsed)
+        );
+    }
+
+    #[test]
+    fn app_28_reset_expires_after_1_hour() {
+        assert_eq!(TokenKind::Reset.lifetime(), Duration::hours(1));
+        assert_eq!(TokenKind::Session.lifetime(), Duration::days(30));
+        let tok = issued(TokenKind::Reset, false);
+        let edge = t0() + Duration::hours(1);
+        assert_eq!(tok.check(edge - Duration::seconds(1)), Ok(()));
+        assert_eq!(tok.check(edge), Err(AuthError::Expired));
+    }
+
+    #[test]
+    fn auth_tokens_are_unique_and_unguessable_length() {
+        let tokens: Vec<Token> = (0..200).map(|_| Token::generate()).collect();
+        let distinct: std::collections::HashSet<&Token> = tokens.iter().collect();
+        assert_eq!(distinct.len(), tokens.len());
+        for t in &tokens {
+            // 32 bytes, unpadded base64url: ceil(32 * 8 / 6) = 43 chars.
+            assert_eq!(t.0.len(), 43);
+            assert!(
+                t.0.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            );
+            assert!(!format!("{t:?}").contains(&t.0));
+        }
+        // Encoder against RFC 4648 vectors, URL-safe alphabet.
+        assert_eq!(base64url(b"f"), "Zg");
+        assert_eq!(base64url(b"fo"), "Zm8");
+        assert_eq!(base64url(b"foo"), "Zm9v");
+        assert_eq!(base64url(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
+    }
 
     // auth-04
     #[test] fn app_27_worker_cannot_set_witness_password() { todo!() }
