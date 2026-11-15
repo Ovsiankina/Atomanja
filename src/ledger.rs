@@ -334,6 +334,13 @@ pub struct Ledger {
     // DECISION: a BTreeMap, not a HashMap, so two ledgers built from the
     // same changes have the same Debug output (db_3 compares it).
     current: std::collections::BTreeMap<TaskId, OccurrenceId>,
+    /// Every `AmountInForce`, in order. Empty means the default amount.
+    // DECISION: amounts stay integer centimes (`Centimes`), never float,
+    // and the history is kept so a late decision uses the amount in force
+    // at its recorded deadline, not at decision time (APP-11, APP-16).
+    amounts: Vec<(Timestamp, Centimes)>,
+    /// The pending proposal (APP-16).
+    proposal: Option<Proposal>,
 }
 
 /// Private per-occurrence columns, indexed by [`OccurrenceId`].
@@ -375,6 +382,7 @@ fn idx(id: u32) -> usize {
 struct Batch {
     out: Vec<Change>,
     next_occ: u32,
+    next_debt: u32,
 }
 
 impl Batch {
@@ -388,9 +396,15 @@ impl Batch {
     }
 
     /// The one-time met/late decision (APP-9, APP-10).
-    fn decide(&mut self, occurrence: OccurrenceId, met: bool, now: Timestamp) {
+    /// A late one gets its single debt at `amount` (APP-11, APP-12).
+    fn decide(&mut self, occurrence: OccurrenceId, met: bool, amount: Centimes, now: Timestamp) {
         let outcome = if met { Outcome::Met } else { Outcome::Late };
         self.out.push(Change::Decided { occurrence, outcome, at: now });
+        if !met {
+            let debt = DebtId(self.next_debt);
+            self.next_debt += 1;
+            self.out.push(Change::DebtCreated { debt, occurrence, amount, at: now });
+        }
     }
 
     /// Start a new occurrence.
@@ -456,6 +470,27 @@ impl Ledger {
             Change::Decided { occurrence, outcome, .. } => {
                 self.occurrences.outcome[idx(occurrence.0)] = outcome;
             }
+            Change::DebtCreated { debt, occurrence, amount, at } => {
+                debug_assert_eq!(idx(debt.0), self.debts.occurrence.len());
+                self.debts.owner.push(None);
+                self.debts.sent_at.push(None);
+                self.debts.received_at.push(None);
+                self.debts.created_at.push(at);
+                self.debts.occurrence.push(occurrence);
+                self.debts.amount.push(amount);
+            }
+            Change::AmountProposed { amount, at } => {
+                self.proposal = Some(Proposal { amount, proposed_at: at, approvals: Vec::new() });
+            }
+            Change::AmountApproved { witness, .. } => {
+                if let Some(p) = self.proposal.as_mut() {
+                    p.approvals.push(witness);
+                }
+            }
+            Change::AmountInForce { amount, at } => {
+                self.amounts.push((at, amount));
+                self.proposal = None;
+            }
             _ => todo!(),
         }
     }
@@ -476,6 +511,7 @@ impl Ledger {
         let mut batch = Batch {
             out: Vec::new(),
             next_occ: next_id(self.occurrences.task.len()),
+            next_debt: next_id(self.debts.occurrence.len()),
         };
         // DECISION: tasks are handled one by one in task-id order (seen
         // tasks and vanished ones alike), each emitting its own changes in
@@ -501,6 +537,15 @@ impl Ledger {
             }
         }
         batch.out
+    }
+
+    /// The amount in force at `moment` (APP-11, APP-16).
+    fn amount_at(&self, moment: Timestamp) -> Centimes {
+        self.amounts
+            .iter()
+            .rev()
+            .find(|&&(at, _)| at <= moment)
+            .map_or(Centimes::DEFAULT_AMOUNT, |&(_, a)| a)
     }
 
     /// APP-8: recurring, and marked done after the current occurrence
@@ -532,7 +577,7 @@ impl Ledger {
                     // The mark-done that advanced it is the done proof.
                     let met = o.done_at.is_some_and(|d| d <= recorded)
                         || self.tracking.seen_done[i];
-                    batch.decide(occ, met, now);
+                    batch.decide(occ, met, self.amount_at(recorded), now);
                 }
                 // DECISION: a new occurrence whose due date is already past
                 // when first seen is not recorded, as APP-5 says for any
@@ -583,7 +628,7 @@ impl Ledger {
         // Vikunja always stamps it, so this only guards odd data.
         let done_in_time =
             visible.is_some_and(|o| o.done && o.done_at.is_some_and(|d| d <= deadline));
-        batch.decide(occ, done_in_time || seen_done, now);
+        batch.decide(occ, done_in_time || seen_done, self.amount_at(deadline), now);
     }
 
     /// A real witness claims an unclaimed debt (APP-18, APP-19, APP-20).
@@ -635,8 +680,10 @@ impl Ledger {
     ///
     /// `InvalidAmount`.
     pub fn propose_amount(&self, amount: Centimes, now: Timestamp) -> Result<Change, RuleError> {
-        let _ = (amount, now);
-        todo!()
+        if amount.0 == 0 || amount == self.amount() {
+            return Err(RuleError::InvalidAmount);
+        }
+        Ok(Change::AmountProposed { amount, at: now })
     }
 
     /// A real witness approves the pending proposal. Returns
@@ -652,8 +699,24 @@ impl Ledger {
         real_witnesses: &[WitnessId],
         now: Timestamp,
     ) -> Result<Vec<Change>, RuleError> {
-        let _ = (witness, real_witnesses, now);
-        todo!()
+        if !real_witnesses.contains(&witness) {
+            return Err(RuleError::NotRealWitness);
+        }
+        let p = self.proposal.as_ref().ok_or(RuleError::NoProposal)?;
+        if p.approvals.contains(&witness) {
+            return Err(RuleError::AlreadyApproved);
+        }
+        let mut out = vec![Change::AmountApproved { witness, at: now }];
+        // DECISION: "every real witness" is the list passed now, so a
+        // witness who joined after the proposal must approve too, and an
+        // approval from someone no longer real does not count.
+        let all = real_witnesses
+            .iter()
+            .all(|w| *w == witness || p.approvals.contains(w));
+        if all {
+            out.push(Change::AmountInForce { amount: p.amount, at: now });
+        }
+        Ok(out)
     }
 
     /// Owed, sent and confirmed totals (APP-24).
@@ -663,12 +726,12 @@ impl Ledger {
 
     /// The amount a debt created now would carry (APP-15, APP-16).
     pub fn amount(&self) -> Centimes {
-        todo!()
+        self.amounts.last().map_or(Centimes::DEFAULT_AMOUNT, |&(_, a)| a)
     }
 
     /// The pending amount proposal, if any (APP-16).
     pub fn proposal(&self) -> Option<&Proposal> {
-        todo!()
+        self.proposal.as_ref()
     }
 
     /// Read access to the occurrence columns, for the views (APP-31, APP-32).
@@ -1108,12 +1171,147 @@ mod tests {
     }
 
     // ledger-05
-    #[test] fn app_11_late_creates_one_debt_with_amount_in_force() { todo!() }
-    #[test] fn app_12_moving_deadline_never_creates_second_debt() { todo!() }
-    #[test] fn app_13_no_operation_removes_or_changes_debt() { todo!() }
-    #[test] fn app_15_default_amount_is_10_chf() { todo!() }
-    #[test] fn app_16_amount_needs_every_real_witness() { todo!() }
-    #[test] fn app_16_new_amount_not_retroactive() { todo!() }
+    const A: WitnessId = WitnessId(100);
+    const B: WitnessId = WitnessId(200);
+
+    /// Put `amount` in force at `now` with the given real witnesses.
+    fn set_amount(l: &mut Ledger, amount: u32, now: i64, witnesses: &[WitnessId]) {
+        let p = l.propose_amount(Centimes(amount), t(now)).unwrap();
+        l.apply(&p);
+        for &w in witnesses {
+            let c = l.approve_amount(w, witnesses, t(now)).unwrap();
+            apply_all(l, &c);
+        }
+        assert_eq!(l.amount(), Centimes(amount));
+    }
+
+    /// One late debt for task 1, deadline `DAY`, on an empty ledger.
+    fn one_late_debt(witnesses: &[WitnessId]) -> (Ledger, Vec<Change>) {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, witnesses);
+        let c = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY + 1, witnesses);
+        (l, c)
+    }
+
+    #[test]
+    fn app_11_late_creates_one_debt_with_amount_in_force() {
+        let (l, c) = one_late_debt(&[]);
+        assert_eq!(
+            c,
+            vec![
+                Change::Decided { occurrence: OccurrenceId(0), outcome: Outcome::Late, at: t(DAY + 1) },
+                Change::DebtCreated {
+                    debt: DebtId(0),
+                    occurrence: OccurrenceId(0),
+                    amount: Centimes(1000),
+                    at: t(DAY + 1),
+                },
+            ]
+        );
+        let d = l.debts();
+        assert_eq!(d.occurrence, vec![OccurrenceId(0)]);
+        assert_eq!(d.amount, vec![Centimes(1000)]);
+        assert_eq!(d.created_at, vec![t(DAY + 1)]);
+        assert_eq!(d.owner, vec![None]);
+        assert_eq!(d.sent_at, vec![None]);
+        assert_eq!(d.received_at, vec![None]);
+
+        // The amount in force at the deadline, not at the decision.
+        let mut m = Ledger::new();
+        poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 0, &[A]);
+        set_amount(&mut m, 2000, 10, &[A]);
+        poll(&mut m, &snap(vec![obs(1, Some(DAY))]), DAY + 1, &[A]);
+        set_amount(&mut m, 3000, DAY + 2, &[A]);
+        assert_eq!(m.debts().amount, vec![Centimes(2000)]);
+    }
+
+    #[test]
+    fn app_12_moving_deadline_never_creates_second_debt() {
+        let (mut l, _) = one_late_debt(&[]);
+        poll(&mut l, &snap(vec![obs(1, Some(DAY / 2))]), DAY + 2, &[]);
+        poll(&mut l, &snap(vec![obs(1, Some(5 * DAY))]), DAY + 3, &[]);
+        poll(&mut l, &snap(vec![obs(1, None)]), 6 * DAY, &[]);
+        poll(&mut l, &snap(vec![]), 7 * DAY, &[]);
+        poll(&mut l, &snap(vec![obs(1, Some(8 * DAY))]), 9 * DAY, &[]);
+        assert_eq!(l.debts().occurrence.len(), 1);
+        assert_eq!(l.occurrences().task.len(), 1);
+        assert_eq!(l.events().kind.len(), 5);
+    }
+
+    #[test]
+    fn app_13_no_operation_removes_or_changes_debt() {
+        let (mut l, _) = one_late_debt(&[A, B]);
+        let before = l.debts().clone();
+        set_amount(&mut l, 5000, DAY + 2, &[A, B]);
+        poll(&mut l, &snap(vec![]), DAY + 3, &[A, B]);
+        poll(&mut l, &snap(vec![obs(1, Some(3 * DAY))]), DAY + 4, &[A, B]);
+        assert_eq!(l.debts(), &before);
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
+        assert_eq!(l.events().kind.len(), 2);
+    }
+
+    #[test]
+    fn app_15_default_amount_is_10_chf() {
+        assert_eq!(Ledger::new().amount(), Centimes(1000));
+        assert_eq!(Ledger::new().amount(), Centimes::DEFAULT_AMOUNT);
+        assert_eq!(Ledger::default().amount(), Centimes::DEFAULT_AMOUNT);
+        assert!(Ledger::new().proposal().is_none());
+    }
+
+    #[test]
+    fn app_16_amount_needs_every_real_witness() {
+        let w = [A, B];
+        let mut l = Ledger::new();
+        assert_eq!(l.approve_amount(A, &w, t(1)), Err(RuleError::NoProposal));
+        assert_eq!(l.propose_amount(Centimes(0), t(1)), Err(RuleError::InvalidAmount));
+        assert_eq!(l.propose_amount(Centimes(1000), t(1)), Err(RuleError::InvalidAmount));
+
+        let p = l.propose_amount(Centimes(1500), t(2)).unwrap();
+        assert_eq!(p, Change::AmountProposed { amount: Centimes(1500), at: t(2) });
+        l.apply(&p);
+        assert_eq!(l.approve_amount(WitnessId(999), &w, t(3)), Err(RuleError::NotRealWitness));
+
+        let c = l.approve_amount(A, &w, t(3)).unwrap();
+        assert_eq!(c, vec![Change::AmountApproved { witness: A, at: t(3) }]);
+        apply_all(&mut l, &c);
+        assert_eq!(l.amount(), Centimes(1000));
+        assert_eq!(l.approve_amount(A, &w, t(4)), Err(RuleError::AlreadyApproved));
+        assert_eq!(
+            l.proposal(),
+            Some(&Proposal { amount: Centimes(1500), proposed_at: t(2), approvals: vec![A] })
+        );
+
+        // A new proposal replaces the old one and clears its approvals.
+        let p = l.propose_amount(Centimes(1200), t(5)).unwrap();
+        l.apply(&p);
+        assert!(l.proposal().unwrap().approvals.is_empty());
+        let c = l.approve_amount(A, &w, t(6)).unwrap();
+        apply_all(&mut l, &c);
+        let c = l.approve_amount(B, &w, t(7)).unwrap();
+        assert_eq!(
+            c,
+            vec![
+                Change::AmountApproved { witness: B, at: t(7) },
+                Change::AmountInForce { amount: Centimes(1200), at: t(7) },
+            ]
+        );
+        apply_all(&mut l, &c);
+        assert_eq!(l.amount(), Centimes(1200));
+        assert!(l.proposal().is_none());
+    }
+
+    #[test]
+    fn app_16_new_amount_not_retroactive() {
+        let w = [A];
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY)), obs(2, Some(3 * DAY))]), 0, &w);
+        set_amount(&mut l, 2500, 2 * DAY, &w);
+        // Both decided late after the change; only task 2's deadline is
+        // after the moment the new amount came into force.
+        poll(&mut l, &snap(vec![obs(1, Some(DAY)), obs(2, Some(3 * DAY))]), 4 * DAY, &w);
+        assert_eq!(l.debts().occurrence, vec![OccurrenceId(0), OccurrenceId(1)]);
+        assert_eq!(l.debts().amount, vec![Centimes(1000), Centimes(2500)]);
+    }
 
     // ledger-06
     #[test] fn app_17_single_witness_auto_claims() { todo!() }
