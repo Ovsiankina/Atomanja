@@ -37,7 +37,9 @@
 use std::marker::PhantomData;
 use std::path::Path;
 
-use crate::auth::{Account, AccountId, Database, IssuedToken, PasswordHash, Role, Token};
+use crate::auth::{
+    Account, AccountId, Database, IssuedToken, PasswordHash, Role, Token, TokenKind,
+};
 use crate::config::Lang;
 use crate::ledger::{
     Centimes, Change, DebtId, EventKind, Ledger, OccurrenceId, Outcome, TaskId, Timestamp,
@@ -257,8 +259,65 @@ impl<K: Kind> Store<K> {
         password_hash: &PasswordHash,
         role: Role,
     ) -> Result<Account, StoreError> {
-        let _ = (email, password_hash, role);
-        todo!()
+        let lang = Lang::Fr;
+        self.conn.execute(
+            "INSERT INTO accounts (email, password_hash, lang, role) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![email, password_hash.0, lang.code(), role as u8],
+        )?;
+        Ok(Account {
+            id: AccountId(self.conn.last_insert_rowid()),
+            email: email.to_owned(),
+            password_hash: password_hash.clone(),
+            lang,
+            role,
+        })
+    }
+
+    /// Accounts matching `filter` (an SQL condition on `?1`), by id.
+    fn query_accounts(
+        &self,
+        filter: &str,
+        arg: &dyn rusqlite::ToSql,
+    ) -> Result<Vec<Account>, StoreError> {
+        let sql = format!(
+            "SELECT id, email, password_hash, lang, role FROM accounts WHERE {filter} ORDER BY id"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map([arg], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, email, hash, lang, role) = row?;
+            out.push(Account {
+                id: AccountId(id),
+                email,
+                password_hash: PasswordHash(hash),
+                lang: Lang::from_code(&lang)
+                    .ok_or_else(|| corrupt(format!("account {id}: lang {lang:?}")))?,
+                role: decode_role(role)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Run an UPDATE on one account row; `NotFound` when no row matched.
+    fn update_account(
+        &mut self,
+        sql: &str,
+        id: AccountId,
+        value: &dyn rusqlite::ToSql,
+    ) -> Result<(), StoreError> {
+        match self.conn.execute(sql, rusqlite::params![id.0, value])? {
+            0 => Err(StoreError::NotFound),
+            _ => Ok(()),
+        }
     }
 
     /// The account with this id, if any.
@@ -268,8 +327,7 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Corrupt`] for an undecodable row,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn account(&self, id: AccountId) -> Result<Option<Account>, StoreError> {
-        let _ = id;
-        todo!()
+        Ok(self.query_accounts("id = ?1", &id.0)?.pop())
     }
 
     /// The account with this email (exact match), if any. Used by login
@@ -280,8 +338,7 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Corrupt`] for an undecodable row,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn account_by_email(&self, email: &str) -> Result<Option<Account>, StoreError> {
-        let _ = email;
-        todo!()
+        Ok(self.query_accounts("email = ?1", &email)?.pop())
     }
 
     /// Every account, by id.
@@ -291,7 +348,7 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Corrupt`] for an undecodable row,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn accounts(&self) -> Result<Vec<Account>, StoreError> {
-        todo!()
+        self.query_accounts("?1", &true)
     }
 
     /// Ids of the real witnesses (`Role::Witness`, admin excluded,
@@ -301,7 +358,13 @@ impl<K: Kind> Store<K> {
     ///
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn real_witnesses(&self) -> Result<Vec<WitnessId>, StoreError> {
-        todo!()
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM accounts WHERE role = ?1 ORDER BY id")?;
+        let ids = stmt
+            .query_map([Role::Witness as u8], |r| r.get(0).map(WitnessId))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     /// Change an account's email. The caller has checked
@@ -313,8 +376,7 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Conflict`] when the email is taken,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn set_email(&mut self, id: AccountId, email: &str) -> Result<(), StoreError> {
-        let _ = (id, email);
-        todo!()
+        self.update_account("UPDATE accounts SET email = ?2 WHERE id = ?1", id, &email)
     }
 
     /// Replace an account's password hash. The caller has checked
@@ -325,8 +387,11 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::NotFound`] for an unknown id,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn set_password(&mut self, id: AccountId, hash: &PasswordHash) -> Result<(), StoreError> {
-        let _ = (id, hash);
-        todo!()
+        self.update_account(
+            "UPDATE accounts SET password_hash = ?2 WHERE id = ?1",
+            id,
+            &hash.0,
+        )
     }
 
     /// Change an account's language (APP-39).
@@ -336,8 +401,11 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::NotFound`] for an unknown id,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn set_lang(&mut self, id: AccountId, lang: Lang) -> Result<(), StoreError> {
-        let _ = (id, lang);
-        todo!()
+        self.update_account(
+            "UPDATE accounts SET lang = ?2 WHERE id = ?1",
+            id,
+            &lang.code(),
+        )
     }
 
     // --- tokens (APP-26, APP-28, sessions) ---
@@ -349,8 +417,18 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Conflict`] when the same secret exists,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn insert_token(&mut self, token: &IssuedToken) -> Result<(), StoreError> {
-        let _ = token;
-        todo!()
+        self.conn.execute(
+            "INSERT INTO tokens (secret, kind, account, issued_at, used)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                token.token.0,
+                token.kind as u8,
+                token.account.map(|a| a.0),
+                encode_time(token.issued_at)?,
+                token.used
+            ],
+        )?;
+        Ok(())
     }
 
     /// The stored row for this secret, if any. The caller runs
@@ -361,8 +439,39 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Corrupt`] for an undecodable row,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn token(&self, token: &Token) -> Result<Option<IssuedToken>, StoreError> {
-        let _ = token;
-        todo!()
+        use rusqlite::OptionalExtension;
+        // DECISION: the secret is the primary key, so the lookup is an
+        // index search, not a byte-by-byte compare in Rust (auth review).
+        let row = self
+            .conn
+            .query_row(
+                "SELECT kind, account, issued_at, used FROM tokens WHERE secret = ?1",
+                [&token.0],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((kind, account, issued_at, used)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(IssuedToken {
+            token: token.clone(),
+            kind: match kind {
+                0 => TokenKind::Invite,
+                1 => TokenKind::Reset,
+                2 => TokenKind::Session,
+                n => return Err(corrupt(format!("token kind {n}"))),
+            },
+            account: account.map(AccountId),
+            issued_at: decode_time(issued_at)?,
+            used,
+        }))
     }
 
     /// Mark a token used, atomically: `Ok(true)` if this call flipped it
@@ -375,8 +484,25 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::NotFound`] for an unknown secret,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn use_token(&mut self, token: &Token) -> Result<bool, StoreError> {
-        let _ = token;
-        todo!()
+        // One conditional UPDATE: SQLite serialises writers, so only one
+        // caller can see the row flip from 0 to 1.
+        let flipped = self.conn.execute(
+            "UPDATE tokens SET used = 1 WHERE secret = ?1 AND used = 0",
+            [&token.0],
+        )?;
+        if flipped == 1 {
+            return Ok(true);
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM tokens WHERE secret = ?1)",
+            [&token.0],
+            |r| r.get(0),
+        )?;
+        if exists {
+            Ok(false)
+        } else {
+            Err(StoreError::NotFound)
+        }
     }
 
     // --- push subscriptions (APP-33) ---
@@ -389,8 +515,13 @@ impl<K: Kind> Store<K> {
     ///
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn upsert_subscription(&mut self, sub: &StoredSubscription) -> Result<(), StoreError> {
-        let _ = sub;
-        todo!()
+        self.conn.execute(
+            "INSERT INTO subscriptions (endpoint, account, p256dh, auth) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (endpoint) DO UPDATE
+             SET account = excluded.account, p256dh = excluded.p256dh, auth = excluded.auth",
+            rusqlite::params![sub.endpoint, sub.account.0, sub.p256dh, sub.auth],
+        )?;
+        Ok(())
     }
 
     /// Every device subscription of an account.
@@ -399,8 +530,20 @@ impl<K: Kind> Store<K> {
     ///
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn subscriptions(&self, account: AccountId) -> Result<Vec<StoredSubscription>, StoreError> {
-        let _ = account;
-        todo!()
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT endpoint, p256dh, auth FROM subscriptions WHERE account = ?1 ORDER BY endpoint",
+        )?;
+        let subs = stmt
+            .query_map([account.0], |r| {
+                Ok(StoredSubscription {
+                    account,
+                    endpoint: r.get(0)?,
+                    p256dh: r.get(1)?,
+                    auth: r.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(subs)
     }
 
     /// Delete the subscription with this endpoint, if any (gone device,
@@ -410,8 +553,9 @@ impl<K: Kind> Store<K> {
     ///
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn remove_subscription(&mut self, endpoint: &str) -> Result<(), StoreError> {
-        let _ = endpoint;
-        todo!()
+        self.conn
+            .execute("DELETE FROM subscriptions WHERE endpoint = ?1", [endpoint])?;
+        Ok(())
     }
 }
 
@@ -421,17 +565,17 @@ impl<K: Kind> Store<K> {
 // silently change what an existing file means. Never renumber; append.
 // The partial unique indexes in `SCHEMA` use these numbers literally.
 mod tag {
-    pub const RECORDED: i64 = 0;
-    pub const SEEN_DONE: i64 = 1;
-    pub const EVENT: i64 = 2;
-    pub const DECIDED: i64 = 3;
-    pub const DEBT_CREATED: i64 = 4;
-    pub const CLAIMED: i64 = 5;
-    pub const MARKED_SENT: i64 = 6;
-    pub const MARKED_RECEIVED: i64 = 7;
-    pub const AMOUNT_PROPOSED: i64 = 8;
-    pub const AMOUNT_APPROVED: i64 = 9;
-    pub const AMOUNT_IN_FORCE: i64 = 10;
+    pub(super) const RECORDED: i64 = 0;
+    pub(super) const SEEN_DONE: i64 = 1;
+    pub(super) const EVENT: i64 = 2;
+    pub(super) const DECIDED: i64 = 3;
+    pub(super) const DEBT_CREATED: i64 = 4;
+    pub(super) const CLAIMED: i64 = 5;
+    pub(super) const MARKED_SENT: i64 = 6;
+    pub(super) const MARKED_RECEIVED: i64 = 7;
+    pub(super) const AMOUNT_PROPOSED: i64 = 8;
+    pub(super) const AMOUNT_APPROVED: i64 = 9;
+    pub(super) const AMOUNT_IN_FORCE: i64 = 10;
 }
 
 /// One `changes` row. `sub` holds the variant's small field: the event
@@ -650,6 +794,28 @@ fn corrupt(what: String) -> StoreError {
     StoreError::Corrupt(what)
 }
 
+fn decode_role(role: i64) -> Result<Role, StoreError> {
+    match role {
+        0 => Ok(Role::Worker),
+        1 => Ok(Role::Witness),
+        2 => Ok(Role::Admin),
+        n => Err(corrupt(format!("role {n}"))),
+    }
+}
+
+/// A token issue time as stored: nanoseconds since the Unix epoch, UTC.
+// DECISION: integer nanoseconds, not RFC 3339 text, so the value round
+// trips exactly and compares as a number. i64 nanoseconds reach year 2262.
+fn encode_time(t: time::OffsetDateTime) -> Result<i64, StoreError> {
+    i64::try_from(t.unix_timestamp_nanos())
+        .map_err(|_| StoreError::Corrupt(format!("time {t} out of range")))
+}
+
+fn decode_time(nanos: i64) -> Result<time::OffsetDateTime, StoreError> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos))
+        .map_err(|_| corrupt(format!("time {nanos} out of range")))
+}
+
 /// A column the row's kind requires.
 fn need(value: Option<i64>, what: &str) -> Result<i64, StoreError> {
     value.ok_or_else(|| corrupt(format!("missing {what}")))
@@ -847,7 +1013,13 @@ mod tests {
         let store = Store::<LedgerDb>::open(&file.0).unwrap();
         assert!(file.0.exists());
         let names = tables(&store);
-        for t in ["accounts", "changes", "deadlines", "subscriptions", "tokens"] {
+        for t in [
+            "accounts",
+            "changes",
+            "deadlines",
+            "subscriptions",
+            "tokens",
+        ] {
             assert!(names.iter().any(|n| n == t), "missing table {t}: {names:?}");
         }
         drop(store);
@@ -1023,7 +1195,11 @@ mod tests {
         let mut all = Vec::new();
         {
             let mut store = Store::<LedgerDb>::open(&file.0).unwrap();
-            let poll = |store: &mut Store<LedgerDb>, live: &mut Ledger, all: &mut Vec<Change>, tasks, now| {
+            let poll = |store: &mut Store<LedgerDb>,
+                        live: &mut Ledger,
+                        all: &mut Vec<Change>,
+                        tasks,
+                        now| {
                 let changes = live.observe(&Snapshot { tasks }, Timestamp(now), &witnesses);
                 commit(store, live, &changes);
                 all.extend(changes);
@@ -1055,7 +1231,10 @@ mod tests {
             assert_eq!(live.debts().occurrence.len(), 1);
 
             let mut manual = Vec::new();
-            manual.push(live.claim(DebtId(0), w1, &witnesses, Timestamp(160)).unwrap());
+            manual.push(
+                live.claim(DebtId(0), w1, &witnesses, Timestamp(160))
+                    .unwrap(),
+            );
             commit(&mut store, &mut live, &manual[manual.len() - 1..]);
             manual.push(live.mark_sent(DebtId(0), Timestamp(170)).unwrap());
             commit(&mut store, &mut live, &manual[manual.len() - 1..]);
@@ -1077,7 +1256,13 @@ mod tests {
                 vec![obs(1, Some(80)), t2_done.clone(), obs(3, None)],
                 250,
             );
-            poll(&mut store, &mut live, &mut all, vec![obs(1, Some(80)), t2_done], 400);
+            poll(
+                &mut store,
+                &mut live,
+                &mut all,
+                vec![obs(1, Some(80)), t2_done],
+                400,
+            );
             assert_eq!(live.amount(), Centimes(2000));
         }
         // Restart: a new handle on the same file.
@@ -1156,9 +1341,264 @@ mod tests {
     }
 
     // store-03
-    #[test] fn store_concurrent_claims_one_row() { todo!() }
-    #[test] fn store_account_crud() { todo!() }
-    #[test] fn store_single_use_token_used_once() { todo!() }
-    #[test] fn store_push_subscriptions_per_device() { todo!() }
-    #[test] fn app_39_account_language_persists_default_french() { todo!() }
+
+    fn hash(s: &str) -> PasswordHash {
+        PasswordHash(format!("$argon2id$v=19$fake${s}"))
+    }
+
+    #[test]
+    fn store_concurrent_claims_one_row() {
+        let file = TempFile::new("claims");
+        let witnesses = [WitnessId(1), WitnessId(2)];
+        {
+            let mut store = Store::<LedgerDb>::open(&file.0).unwrap();
+            store
+                .append(&[
+                    recorded(0, 1, 100, 0),
+                    Change::Decided {
+                        occurrence: OccurrenceId(0),
+                        outcome: Outcome::Late,
+                        at: Timestamp(200),
+                    },
+                    debt_created(0, 0, 200),
+                ])
+                .unwrap();
+        }
+        // Two requests, two connections, same unclaimed debt, same moment.
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<(), StoreError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = witnesses
+                .iter()
+                .map(|&w| {
+                    let (path, barrier) = (&file.0, &barrier);
+                    s.spawn(move || {
+                        let mut store = Store::<LedgerDb>::open(path).unwrap();
+                        let ledger = store.load_ledger().unwrap();
+                        let claim = ledger
+                            .claim(DebtId(0), w, &witnesses, Timestamp(300))
+                            .unwrap();
+                        barrier.wait();
+                        store.append(&[claim])
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(StoreError::Conflict)))
+                .count(),
+            1,
+            "{results:?}"
+        );
+        let store = Store::<LedgerDb>::open(&file.0).unwrap();
+        let claims = store
+            .load_changes()
+            .unwrap()
+            .into_iter()
+            .filter(|c| matches!(c, Change::Claimed { .. }))
+            .count();
+        assert_eq!(claims, 1);
+        assert!(store.load_ledger().unwrap().debts().owner[0].is_some());
+    }
+
+    fn account_crud<K: Kind>() {
+        let mut store = Store::<K>::open_in_memory().unwrap();
+        let worker = store
+            .insert_account("w@example.org", &hash("w"), Role::Worker)
+            .unwrap();
+        let witness = store
+            .insert_account("a@example.org", &hash("a"), Role::Witness)
+            .unwrap();
+        let admin = store
+            .insert_account("admin@example.org", &hash("x"), Role::Admin)
+            .unwrap();
+        assert_ne!(worker.id, witness.id);
+        assert_eq!(worker.email, "w@example.org");
+        assert_eq!(worker.password_hash, hash("w"));
+        assert_eq!(worker.role, Role::Worker);
+
+        assert_eq!(store.account(witness.id).unwrap(), Some(witness.clone()));
+        assert_eq!(
+            store.account_by_email("admin@example.org").unwrap(),
+            Some(admin.clone())
+        );
+        assert_eq!(store.account_by_email("ADMIN@example.org").unwrap(), None);
+        assert_eq!(store.account(AccountId(999)).unwrap(), None);
+        assert_eq!(
+            store.accounts().unwrap(),
+            vec![worker.clone(), witness.clone(), admin.clone()]
+        );
+        assert_eq!(
+            store.real_witnesses().unwrap(),
+            vec![WitnessId(witness.id.0)]
+        );
+
+        assert!(matches!(
+            store.insert_account("a@example.org", &hash("b"), Role::Witness),
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            store.set_email(worker.id, "a@example.org"),
+            Err(StoreError::Conflict)
+        ));
+        store.set_email(worker.id, "new@example.org").unwrap();
+        store.set_password(worker.id, &hash("new")).unwrap();
+        let w = store.account(worker.id).unwrap().unwrap();
+        assert_eq!(w.email, "new@example.org");
+        assert_eq!(w.password_hash, hash("new"));
+        assert_eq!(store.account_by_email("w@example.org").unwrap(), None);
+
+        let ghost = AccountId(999);
+        assert!(matches!(
+            store.set_email(ghost, "g@example.org"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.set_password(ghost, &hash("g")),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.set_lang(ghost, Lang::En),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(store.accounts().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn store_account_crud() {
+        account_crud::<LedgerDb>();
+        account_crud::<DevDb>();
+    }
+
+    fn single_use_token<K: Kind>() {
+        let mut store = Store::<K>::open_in_memory().unwrap();
+        let issued_at = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+            + time::Duration::nanoseconds(123_456_789);
+        let reset = IssuedToken {
+            token: Token("reset-secret".into()),
+            kind: TokenKind::Reset,
+            account: Some(AccountId(4)),
+            issued_at,
+            used: false,
+        };
+        let invite = IssuedToken {
+            token: Token("invite-secret".into()),
+            kind: TokenKind::Invite,
+            account: None,
+            issued_at,
+            used: false,
+        };
+        store.insert_token(&reset).unwrap();
+        store.insert_token(&invite).unwrap();
+        assert!(matches!(
+            store.insert_token(&reset),
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(store.token(&reset.token).unwrap(), Some(reset.clone()));
+        assert_eq!(store.token(&invite.token).unwrap(), Some(invite.clone()));
+        assert_eq!(store.token(&Token("nope".into())).unwrap(), None);
+
+        assert!(store.use_token(&reset.token).unwrap());
+        assert!(!store.use_token(&reset.token).unwrap());
+        let used = store.token(&reset.token).unwrap().unwrap();
+        assert!(used.used);
+        assert!(used.check(issued_at).is_err());
+        // The other token is untouched.
+        assert!(!store.token(&invite.token).unwrap().unwrap().used);
+        assert!(matches!(
+            store.use_token(&Token("nope".into())),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn store_single_use_token_used_once() {
+        single_use_token::<LedgerDb>();
+        single_use_token::<DevDb>();
+    }
+
+    fn sub(account: i64, endpoint: &str, key: &str) -> StoredSubscription {
+        StoredSubscription {
+            account: AccountId(account),
+            endpoint: endpoint.into(),
+            p256dh: format!("p256-{key}"),
+            auth: format!("auth-{key}"),
+        }
+    }
+
+    fn push_subscriptions<K: Kind>() {
+        let mut store = Store::<K>::open_in_memory().unwrap();
+        let phone = sub(1, "https://push.example/phone", "1");
+        let laptop = sub(1, "https://push.example/laptop", "2");
+        let other = sub(2, "https://push.example/other", "3");
+        for s in [&phone, &laptop, &other] {
+            store.upsert_subscription(s).unwrap();
+        }
+        let mut mine = store.subscriptions(AccountId(1)).unwrap();
+        mine.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        assert_eq!(mine, vec![laptop.clone(), phone.clone()]);
+        assert_eq!(
+            store.subscriptions(AccountId(2)).unwrap(),
+            vec![other.clone()]
+        );
+
+        // Same device re-subscribes under another account with new keys.
+        let moved = sub(2, "https://push.example/phone", "9");
+        store.upsert_subscription(&moved).unwrap();
+        assert_eq!(
+            store.subscriptions(AccountId(1)).unwrap(),
+            vec![laptop.clone()]
+        );
+        let mut theirs = store.subscriptions(AccountId(2)).unwrap();
+        theirs.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        assert_eq!(theirs, vec![other.clone(), moved.clone()]);
+
+        store.remove_subscription(&laptop.endpoint).unwrap();
+        store
+            .remove_subscription("https://push.example/unknown")
+            .unwrap();
+        assert!(store.subscriptions(AccountId(1)).unwrap().is_empty());
+        assert_eq!(store.subscriptions(AccountId(3)).unwrap(), vec![]);
+
+        let debug = format!("{moved:?}");
+        assert!(
+            !debug.contains("p256-9") && !debug.contains("auth-9"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn store_push_subscriptions_per_device() {
+        push_subscriptions::<LedgerDb>();
+        push_subscriptions::<DevDb>();
+    }
+
+    fn language_persists<K: Kind>() {
+        let file = TempFile::new("lang");
+        let id = {
+            let mut store = Store::<K>::open(&file.0).unwrap();
+            let a = store
+                .insert_account("a@example.org", &hash("a"), Role::Witness)
+                .unwrap();
+            assert_eq!(a.lang, Lang::Fr);
+            assert_eq!(store.account(a.id).unwrap().unwrap().lang, Lang::Fr);
+            store.set_lang(a.id, Lang::En).unwrap();
+            a.id
+        };
+        let store = Store::<K>::open(&file.0).unwrap();
+        assert_eq!(store.account(id).unwrap().unwrap().lang, Lang::En);
+    }
+
+    #[test]
+    fn app_39_account_language_persists_default_french() {
+        language_persists::<LedgerDb>();
+        language_persists::<DevDb>();
+    }
 }
