@@ -662,6 +662,9 @@ mod tests {
             Change::Recorded { occurrence: occ, task: TASK, deadline: Timestamp(100), at: Timestamp(10) },
             Change::SeenDone { occurrence: occ, done: true, at: Timestamp(20) },
             Change::Event { occurrence: occ, kind: EventKind::MovedLater, new_due: Some(Timestamp(150)), at: Timestamp(30) },
+            // DECISION: Restored is a due-date event like the others, so it
+            // notifies nobody either (APP-37); no wording needed.
+            Change::Event { occurrence: occ, kind: EventKind::Restored, new_due: Some(Timestamp(100)), at: Timestamp(40) },
             Change::Decided { occurrence: occ, outcome: Outcome::Met, at: Timestamp(151) },
             Change::AmountProposed { amount: Centimes(2000), at: Timestamp(160) },
             Change::AmountApproved { witness: witness(ALICE), at: Timestamp(170) },

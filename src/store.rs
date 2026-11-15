@@ -718,6 +718,7 @@ impl ChangeRow {
                     1 => EventKind::MovedEarlier,
                     2 => EventKind::Removed,
                     3 => EventKind::Deleted,
+                    4 => EventKind::Restored,
                     n => return Err(corrupt(format!("event kind {n}"))),
                 },
                 new_due: self.due.map(Timestamp),
@@ -1267,6 +1268,18 @@ mod tests {
                 vec![obs(1, Some(80)), t2_done.clone(), obs(3, None)],
                 250,
             );
+            // Due date set back to the recorded deadline: EventKind::Restored.
+            poll(
+                &mut store,
+                &mut live,
+                &mut all,
+                vec![obs(1, Some(80)), t2_done.clone(), obs(3, Some(300))],
+                260,
+            );
+            assert!(all.iter().any(|c| matches!(
+                c,
+                Change::Event { kind: EventKind::Restored, .. }
+            )));
             poll(
                 &mut store,
                 &mut live,
