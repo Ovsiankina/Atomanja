@@ -49,6 +49,7 @@ use crate::notify::Notifier;
 use crate::store::{DevDb, LedgerDb, Store};
 
 mod actions;
+mod assets;
 mod handlers;
 mod i18n;
 mod links;
@@ -97,6 +98,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/reset", get(links::reset_request_form).post(links::reset_request))
         .route("/reset/{token}", get(links::reset_form).post(links::reset))
         .route("/debts/{id}/claim", post(actions::claim))
+        .route("/assets/{name}", get(assets::asset))
         .with_state(state)
 }
 
@@ -441,7 +443,97 @@ mod tests {
     }
 
     // web-04
-    #[test] fn app_31_worker_view_shows_titles_debts_totals() { todo!() }
+    /// Accounts of [`rich_ledger`].
+    struct People {
+        worker: crate::auth::Account,
+        a: crate::auth::Account,
+        b: crate::auth::Account,
+    }
+
+    /// Worker, witnesses a and b, and one row of every kind, with titles:
+    /// #47 received, #48 sent, #49 unclaimed, #50 met, #51 upcoming with
+    /// a moved deadline, #52 claimed by a and not sent.
+    fn rich_ledger(h: &Harness) -> People {
+        use crate::ledger::{Change, EventKind, OccurrenceId, Outcome, TaskId, Timestamp};
+        let t = testkit::DEADLINE;
+        h.ledger(|s| {
+            let worker = testkit::account(s, "worker@atomanja.test", Role::Worker);
+            let a = testkit::account(s, "a@witness.test", Role::Witness);
+            let b = testkit::account(s, "b@witness.test", Role::Witness);
+            let received = testkit::late_debt(s, 47, Some(a.id.0));
+            let sent = testkit::late_debt(s, 48, Some(a.id.0));
+            testkit::late_debt(s, 49, None);
+            s.append(&[
+                Change::MarkedSent { debt: received, at: Timestamp(t + 100) },
+                Change::MarkedReceived { debt: received, at: Timestamp(t + 200) },
+                Change::MarkedSent { debt: sent, at: Timestamp(t + 100) },
+                Change::Recorded { occurrence: OccurrenceId(3), task: TaskId(50), deadline: Timestamp(t), at: Timestamp(t - 9000) },
+                Change::Decided { occurrence: OccurrenceId(3), outcome: Outcome::Met, at: Timestamp(t + 60) },
+                Change::Recorded { occurrence: OccurrenceId(4), task: TaskId(51), deadline: Timestamp(t), at: Timestamp(t - 9000) },
+                Change::Event { occurrence: OccurrenceId(4), kind: EventKind::MovedLater, new_due: Some(Timestamp(t + 6 * 86_400)), at: Timestamp(t - 3600) },
+            ])
+            .unwrap();
+            testkit::late_debt(s, 52, Some(a.id.0));
+            People { worker, a, b }
+        })
+        .tap(|_| {
+            for (n, title) in [(47, "Pay rent"), (48, "Write report"), (49, "Call dentist"), (50, "Water plants"), (51, "File taxes"), (52, "Fix bike")] {
+                h.title(n, title);
+            }
+        })
+    }
+
+    /// `tap` for the fixture above.
+    trait Tap: Sized {
+        fn tap(self, f: impl FnOnce(&Self)) -> Self {
+            f(&self);
+            self
+        }
+    }
+    impl<T> Tap for T {}
+
+    #[tokio::test]
+    async fn app_31_worker_view_shows_titles_debts_totals() {
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let cookie = h.ledger(|s| testkit::session(s, &p.worker));
+        let page = h.get("/", Some(&cookie)).await;
+        assert_eq!(page.status, 200);
+        let body = &page.body;
+        assert!(body.contains(r#"data-view="worker""#));
+        for title in ["Pay rent", "Write report", "Call dentist", "Water plants", "File taxes", "Fix bike"] {
+            assert!(body.contains(title), "title {title} shown: {body}");
+        }
+        for n in 47..=52 {
+            assert!(body.contains(&format!("#{n}")), "task number #{n}");
+        }
+        assert!(body.contains("14 nov."), "recorded deadline, day then month");
+        for word in ["En retard", "Tenu", "À venir", "Envoyé", "Reçu"] {
+            assert!(body.contains(word), "status {word}");
+        }
+        assert!(body.contains("Réclamée par a@witness.test"), "owner shown");
+        assert!(body.contains("Non réclamée"));
+        assert!(body.contains("10 CHF"));
+        assert!(body.contains("at-check is-on"), "marks shown");
+        assert!(
+            body.contains("Échéance déplacée au 20 nov. dans Vikunja. Le 14 nov. compte toujours."),
+            "deadline event under its task: {body}"
+        );
+        // Totals: owed every debt (4), sent 2, confirmed 1 (APP-19, APP-24).
+        assert!(body.contains(r#"at-total__n">40<"#), "owed: {body}");
+        assert!(body.contains(r#"at-total__n">20<"#), "sent");
+        assert!(body.contains(r#"at-total__n">10<"#), "confirmed");
+        // The worker's one action: mark sent on the claimed, unsent debt (#52 = debt 3).
+        assert!(body.contains(r#"action="/debts/3/sent""#), "{body}");
+        assert!(!body.contains("/claim\""), "the worker never claims");
+        assert!(!body.contains("/received\""));
+        // The page is styled by the vendored design system.
+        assert!(body.contains("/assets/bundle.css"));
+        let css = h.get("/assets/bundle.css", None).await;
+        assert_eq!(css.status, 200);
+        assert!(css.body.contains(".at-row"));
+        let _ = (p.a, p.b);
+    }
 
     // web-05
     #[test] fn app_32_witness_view_never_contains_task_title() { todo!() }
