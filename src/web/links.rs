@@ -115,7 +115,7 @@ pub(super) async fn create_invite(
         };
         settings::account_panel(m, &accounts, &actor.account, Some(&outcome)).into_response()
     } else {
-        settings::render(&state, &actor.account, Some(&outcome))
+        settings::render(&state, &actor.account, Some(&outcome), None)
     }
 }
 

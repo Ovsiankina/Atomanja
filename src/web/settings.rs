@@ -12,6 +12,7 @@ use super::pages::{self, Field, Variant};
 use super::session::{internal, lock};
 use super::AppState;
 use crate::auth::{self, Account, Action, Database, Role};
+use crate::ledger::{Ledger, WitnessId};
 use crate::store::{Kind, Store, StoreError};
 
 /// A freshly created invite link and what happened to its email.
@@ -27,15 +28,21 @@ pub(super) async fn settings(State(state): State<AppState>, headers: HeaderMap) 
         Ok(a) => a,
         Err(r) => return r,
     };
-    render(&state, &actor.account, None)
+    render(&state, &actor.account, None, None)
 }
 
 /// The full settings page for `account`, from its role's file (DEV-3).
-pub(super) fn render(state: &AppState, account: &Account, invite: Option<&InviteOutcome>) -> Response {
+/// `amount_error` explains a refused amount action (plain form posts).
+pub(super) fn render(
+    state: &AppState,
+    account: &Account,
+    invite: Option<&InviteOutcome>,
+    amount_error: Option<&str>,
+) -> Response {
     let m = msgs(account.lang);
     let body = match account.role.database() {
-        Database::Ledger => body(&*lock(&state.ledger), account, invite),
-        Database::Dev => body(&*lock(&state.dev), account, invite),
+        Database::Ledger => body(&*lock(&state.ledger), account, invite, amount_error),
+        Database::Dev => body(&*lock(&state.dev), account, invite, amount_error),
     };
     match body {
         Ok(b) => page(m, m.nav_settings, "settings", &b),
@@ -48,17 +55,80 @@ fn body<K: Kind>(
     store: &Store<K>,
     account: &Account,
     invite: Option<&InviteOutcome>,
+    amount_error: Option<&str>,
 ) -> Result<Markup, StoreError> {
     let m = msgs(account.lang);
     let accounts = store.accounts()?;
+    let ledger = store.load_ledger()?;
     Ok(html! {
         div.page__stack data-view="settings" {
             @if account.role == Role::Admin {
                 div.page__pinned { (pages::banner(true, m.fake_label, m.fake_text)) }
             }
-            (pages::section(1, m.accounts, &account_panel(m, &accounts, account, invite)))
+            (pages::section(1, m.amount_per_task, &amount_block(m, &ledger, &accounts, account, amount_error)))
+            (pages::section(2, m.accounts, &account_panel(m, &accounts, account, invite)))
         }
     })
+}
+
+/// The `AmountProposal`: the amount in force, the open proposal with one
+/// vote row per real witness, the worker's form and the witness's Agree
+/// button (APP-15, APP-16). Its `id` is the htmx target of both actions.
+///
+/// DECISION: no Decline button. The ledger records approvals only; a
+/// proposal stays open until every real witness agrees or the worker
+/// proposes another amount, so "decline" would set nothing.
+pub(super) fn amount_block(
+    m: &Msgs,
+    ledger: &Ledger,
+    accounts: &[Account],
+    me: &Account,
+    error: Option<&str>,
+) -> Markup {
+    let current = m.number(ledger.amount());
+    let witnesses: Vec<&Account> = accounts.iter().filter(|a| a.role.is_real_witness()).collect();
+    let proposal = ledger.proposal();
+    let agreed = |a: &Account| proposal.is_some_and(|p| p.approvals.contains(&WitnessId(a.id.0)));
+    html! {
+        section.at-proposal id="amount" {
+            @if let Some(p) = proposal {
+                p.at-label { (m.proposed_change) }
+                p.at-proposal__n {
+                    (current)
+                    span.at-proposal__to aria-label="→" { "→" }
+                    (m.number(p.amount))
+                    span.at-unit { "CHF" }
+                }
+                p.at-muted { (m.agreed_count(witnesses.iter().filter(|a| agreed(a)).count(), witnesses.len())) }
+                ul.at-people {
+                    @for w in &witnesses {
+                        li.at-person {
+                            span.at-person__name { (w.email) }
+                            @if agreed(w) { (pages::tag("received", m.vote_agreed)) }
+                            @else { (pages::tag("upcoming", m.vote_pending)) }
+                        }
+                    }
+                }
+                @if auth::permits(me, Action::ApproveAmount) && !agreed(me) {
+                    form.at-proposal__act method="post" action="/amount/approve"
+                        hx-post="/amount/approve" hx-target="#amount" hx-swap="outerHTML" {
+                        (pages::button(m.agree, Variant::Solid, false, false, None))
+                    }
+                }
+            } @else {
+                p.at-label { (m.amount_per_task) }
+                p.at-proposal__n { (current) span.at-unit { "CHF" } }
+            }
+            @if let Some(e) = error { p.row__error role="alert" { (e) } }
+            @if auth::permits(me, Action::ProposeAmount) {
+                form.at-proposal__form method="post" action="/amount/propose"
+                    hx-post="/amount/propose" hx-target="#amount" hx-swap="outerHTML" {
+                    (Field { hint: Some(m.propose_hint), ..Field::new(m.propose_field, "amount", "number", "off") }.render())
+                    (pages::button(m.propose, Variant::Outline, false, false, Some("→")))
+                }
+            }
+        }
+    }
 }
 
 /// The `AccountPanel`: the one worker, the witnesses, and for the worker

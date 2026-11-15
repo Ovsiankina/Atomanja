@@ -72,7 +72,7 @@ fn dashboard_from<K: Kind>(
         titles,
         names: Ctx::names_of(&store.accounts()?),
     };
-    Ok(views::dashboard(&ctx, &ledger))
+    Ok(views::dashboard(&ctx, &ledger, None))
 }
 
 /// The login form, with an optional error or notice.

@@ -98,6 +98,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/reset", get(links::reset_request_form).post(links::reset_request))
         .route("/reset/{token}", get(links::reset_form).post(links::reset))
         .route("/debts/{id}/claim", post(actions::claim))
+        .route("/debts/{id}/sent", post(actions::sent))
+        .route("/debts/{id}/received", post(actions::received))
+        .route("/amount/propose", post(actions::propose))
+        .route("/amount/approve", post(actions::approve))
         .route("/assets/{name}", get(assets::asset))
         .with_state(state)
 }
@@ -571,10 +575,170 @@ mod tests {
     }
 
     // web-06
-    #[test] fn app_18_claim_action_second_claim_rejected() { todo!() }
-    #[test] fn app_21_mark_sent_action_worker_only() { todo!() }
-    #[test] fn app_22_mark_received_action_owner_only() { todo!() }
-    #[test] fn app_16_amount_propose_and_approve_actions() { todo!() }
+    /// Every stored change matching `keep`.
+    fn count(h: &Harness, keep: impl Fn(&crate::ledger::Change) -> bool) -> usize {
+        h.ledger(|s| s.load_changes().unwrap().iter().filter(|c| keep(c)).count())
+    }
+
+    #[tokio::test]
+    async fn app_18_claim_action_second_claim_rejected() {
+        use crate::ledger::{Change, DebtId, WitnessId};
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let (ca, cb) = h.ledger(|s| (testkit::session(s, &p.a), testkit::session(s, &p.b)));
+        let cw = h.ledger(|s| testkit::session(s, &p.worker));
+        let claims_of_2 = |h: &Harness| count(h, |c| matches!(c, Change::Claimed { debt: DebtId(2), .. }));
+
+        let first = h.hx_post("/debts/2/claim", Some(&ca), &[]).await;
+        assert_eq!(first.status, 200, "{}", first.body);
+        assert!(first.body.starts_with("<li"), "htmx gets the row: {}", first.body);
+        assert!(first.body.contains("Réclamée par vous"));
+        assert!(first.body.contains(r#"hx-swap-oob="true""#), "totals refreshed");
+        for title in TITLES {
+            assert!(!first.body.contains(title), "witness fragment leaks {title}");
+        }
+        let owner = h.ledger(|s| s.load_ledger().unwrap().debts().owner[2]);
+        assert_eq!(owner, Some(WitnessId(p.a.id.0)));
+
+        let second = h.hx_post("/debts/2/claim", Some(&cb), &[]).await;
+        assert_eq!(second.status, 409);
+        assert!(second.body.contains("Déjà réclamée par un autre témoin."), "{}", second.body);
+        assert!(second.body.contains("Réclamée par a@witness.test"), "row shows the real owner");
+        assert_eq!(claims_of_2(&h), 1, "no duplicate claim row");
+        let again = h.post("/debts/2/claim", Some(&ca), &[]).await;
+        assert_eq!(again.status, 409, "double click");
+        assert_eq!(claims_of_2(&h), 1);
+
+        assert_eq!(h.post("/debts/2/claim", Some(&cw), &[]).await.status, 403, "the worker never claims");
+        assert_eq!(h.post("/debts/99/claim", Some(&cb), &[]).await.status, 404);
+
+        // Plain form post: redirect back to the view.
+        let debt = h.ledger(|s| testkit::late_debt(s, 53, None));
+        let plain = h.post(&format!("/debts/{}/claim", debt.0), Some(&cb), &[]).await;
+        assert_eq!(plain.status, 303);
+        assert_eq!(plain.location(), Some("/"));
+        let owner = h.ledger(|s| s.load_ledger().unwrap().debts().owner[debt.0 as usize]);
+        assert_eq!(owner, Some(WitnessId(p.b.id.0)));
+        assert_eq!(h.post("/debts/2/claim", None, &[]).await.status, 303, "anonymous goes to login");
+        assert_eq!(claims_of_2(&h), 1);
+    }
+
+    #[tokio::test]
+    async fn app_21_mark_sent_action_worker_only() {
+        use crate::ledger::{Change, DebtId};
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let (cw, ca) = h.ledger(|s| (testkit::session(s, &p.worker), testkit::session(s, &p.a)));
+        let sent_3 = |h: &Harness| count(h, |c| matches!(c, Change::MarkedSent { debt: DebtId(3), .. }));
+
+        assert_eq!(h.post("/debts/3/sent", Some(&ca), &[]).await.status, 403, "witness cannot mark sent");
+        assert_eq!(sent_3(&h), 0);
+
+        let unclaimed = h.hx_post("/debts/2/sent", Some(&cw), &[]).await;
+        assert_eq!(unclaimed.status, 409, "only on a claimed debt");
+        assert!(unclaimed.body.contains("Personne n'a encore réclamé cette dette."), "{}", unclaimed.body);
+
+        let ok = h.hx_post("/debts/3/sent", Some(&cw), &[]).await;
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        assert!(ok.body.contains("Fix bike"), "worker fragment keeps the title");
+        assert!(ok.body.contains("at-row--sent"));
+        assert_eq!(sent_3(&h), 1);
+
+        let twice = h.hx_post("/debts/3/sent", Some(&cw), &[]).await;
+        assert_eq!(twice.status, 409, "APP-23");
+        assert!(twice.body.contains("Déjà marquée."));
+        assert_eq!(sent_3(&h), 1);
+
+        let plain = h.post("/debts/2/sent", Some(&cw), &[]).await;
+        assert_eq!(plain.status, 409, "plain post shows the page with the reason");
+        assert!(plain.body.contains("<html"));
+        assert!(plain.body.contains("Personne n'a encore réclamé cette dette."));
+    }
+
+    #[tokio::test]
+    async fn app_22_mark_received_action_owner_only() {
+        use crate::ledger::{Change, DebtId};
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let (cw, ca, cb) = h.ledger(|s| {
+            (testkit::session(s, &p.worker), testkit::session(s, &p.a), testkit::session(s, &p.b))
+        });
+        let received_1 = |h: &Harness| count(h, |c| matches!(c, Change::MarkedReceived { debt: DebtId(1), .. }));
+
+        assert_eq!(h.post("/debts/1/received", Some(&cw), &[]).await.status, 403);
+        let other = h.hx_post("/debts/1/received", Some(&cb), &[]).await;
+        assert_eq!(other.status, 409);
+        assert!(other.body.contains("Seul le témoin qui l'a réclamée"), "{}", other.body);
+        let early = h.hx_post("/debts/3/received", Some(&ca), &[]).await;
+        assert_eq!(early.status, 409, "received needs sent first");
+        assert!(early.body.contains("pas encore marquée envoyée"), "{}", early.body);
+        assert_eq!(received_1(&h), 0);
+
+        let plain = h.post("/debts/1/received", Some(&ca), &[]).await;
+        assert_eq!(plain.status, 303);
+        assert_eq!(received_1(&h), 1);
+        let twice = h.hx_post("/debts/1/received", Some(&ca), &[]).await;
+        assert_eq!(twice.status, 409);
+        assert_eq!(received_1(&h), 1);
+
+        // APP-24: both the worker and the owner witness see both marks.
+        for cookie in [&cw, &ca] {
+            let page = h.get("/", Some(cookie)).await.body;
+            let row = &page[page.find(r#"id="occ-1""#).unwrap()..];
+            let row = &row[..row.find("</li>").unwrap()];
+            assert_eq!(row.matches("at-check is-on").count(), 2, "{row}");
+        }
+    }
+
+    #[tokio::test]
+    async fn app_16_amount_propose_and_approve_actions() {
+        use crate::ledger::Centimes;
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let (cw, ca, cb) = h.ledger(|s| {
+            (testkit::session(s, &p.worker), testkit::session(s, &p.a), testkit::session(s, &p.b))
+        });
+        let state = |h: &Harness| {
+            h.ledger(|s| {
+                let l = s.load_ledger().unwrap();
+                (l.amount(), l.proposal().map(|p| (p.amount, p.approvals.len())))
+            })
+        };
+
+        let settings = h.get("/settings", Some(&cw)).await.body;
+        assert!(settings.contains("Montant par tâche en retard"), "{settings}");
+        assert!(settings.contains(r#"action="/amount/propose""#));
+
+        assert_eq!(h.post("/amount/propose", Some(&ca), &[("amount", "15")]).await.status, 403);
+        let bad = h.hx_post("/amount/propose", Some(&cw), &[("amount", "10")]).await;
+        assert_eq!(bad.status, 409, "same as the amount in force");
+        assert!(bad.body.contains("Indiquez un nombre entier de CHF"), "{}", bad.body);
+        let junk = h.hx_post("/amount/propose", Some(&cw), &[("amount", "ten")]).await;
+        assert_eq!(junk.status, 409);
+        assert_eq!(state(&h), (Centimes(1000), None));
+
+        let proposed = h.hx_post("/amount/propose", Some(&cw), &[("amount", "15")]).await;
+        assert_eq!(proposed.status, 200, "{}", proposed.body);
+        assert!(proposed.body.contains(r#"id="amount""#), "htmx gets the proposal block");
+        assert!(proposed.body.contains("0 témoin(s) sur 2"), "{}", proposed.body);
+        assert_eq!(state(&h), (Centimes(1000), Some((Centimes(1500), 0))), "not in force yet");
+
+        assert_eq!(h.post("/amount/approve", Some(&cw), &[]).await.status, 403, "worker cannot approve");
+        let one = h.hx_post("/amount/approve", Some(&ca), &[]).await;
+        assert_eq!(one.status, 200, "{}", one.body);
+        assert!(one.body.contains("1 témoin(s) sur 2"));
+        assert_eq!(state(&h), (Centimes(1000), Some((Centimes(1500), 1))), "needs every witness");
+        let twice = h.hx_post("/amount/approve", Some(&ca), &[]).await;
+        assert_eq!(twice.status, 409);
+        assert!(twice.body.contains("Vous êtes déjà d'accord."));
+
+        let last = h.post("/amount/approve", Some(&cb), &[]).await;
+        assert_eq!(last.status, 303, "plain form post");
+        assert_eq!(last.location(), Some("/settings"));
+        assert_eq!(state(&h), (Centimes(1500), None), "in force once all agreed");
+        let after = h.get("/settings", Some(&cb)).await.body;
+        assert!(after.contains(r#"at-proposal__n">15<"#), "{after}");
+    }
 
     // web-07
     #[test] fn app_33_manifest_served() { todo!() }

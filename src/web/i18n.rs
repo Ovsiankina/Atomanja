@@ -7,7 +7,7 @@
 // error because both catalogues fill the same struct.
 
 use crate::config::Lang;
-use crate::ledger::{Centimes, Timestamp};
+use crate::ledger::{Centimes, RuleError, Timestamp};
 
 /// Every fixed text of the interface, in one language.
 pub(super) struct Msgs {
@@ -48,6 +48,12 @@ pub(super) struct Msgs {
     pub err_already_claimed: &'static str,
     pub err_forbidden: &'static str,
     pub err_state: &'static str,
+    pub err_not_owner: &'static str,
+    pub err_not_claimed: &'static str,
+    pub err_not_sent: &'static str,
+    pub err_already_marked: &'static str,
+    pub err_no_proposal: &'static str,
+    pub err_already_approved: &'static str,
     pub err_unknown_debt: &'static str,
     pub err_server: &'static str,
     pub err_not_found: &'static str,
@@ -145,6 +151,12 @@ const EN: Msgs = Msgs {
     err_already_claimed: "Already claimed by another witness.",
     err_forbidden: "Your account cannot do this.",
     err_state: "Not possible in this state.",
+    err_not_owner: "Only the witness who claimed it marks it received.",
+    err_not_claimed: "Nobody has claimed this debt yet.",
+    err_not_sent: "The worker has not marked it sent yet.",
+    err_already_marked: "Already marked. Marks are never undone.",
+    err_no_proposal: "No amount change is open.",
+    err_already_approved: "You already agreed.",
     err_unknown_debt: "No such debt.",
     err_server: "Something went wrong. Try again.",
     err_not_found: "No such page.",
@@ -248,6 +260,12 @@ const FR: Msgs = Msgs {
     err_already_claimed: "Déjà réclamée par un autre témoin.",
     err_forbidden: "Votre compte ne peut pas faire cela.",
     err_state: "Impossible dans cet état.",
+    err_not_owner: "Seul le témoin qui l'a réclamée la marque reçue.",
+    err_not_claimed: "Personne n'a encore réclamé cette dette.",
+    err_not_sent: "Le travailleur ne l'a pas encore marquée envoyée.",
+    err_already_marked: "Déjà marquée. Une marque ne s'annule pas.",
+    err_no_proposal: "Aucun changement de montant en cours.",
+    err_already_approved: "Vous êtes déjà d'accord.",
     err_unknown_debt: "Dette inconnue.",
     err_server: "Une erreur est survenue. Réessayez.",
     err_not_found: "Page introuvable.",
@@ -381,6 +399,22 @@ impl Msgs {
             Lang::En => format!(
                 "{agreed} of {total} witnesses agreed. It changes only when all agree."
             ),
+        }
+    }
+
+    /// Why the ledger refused an action, in one sentence.
+    pub fn rule(&self, e: RuleError) -> &'static str {
+        match e {
+            RuleError::UnknownDebt => self.err_unknown_debt,
+            RuleError::NotRealWitness => self.err_forbidden,
+            RuleError::AlreadyClaimed => self.err_already_claimed,
+            RuleError::NotClaimed => self.err_not_claimed,
+            RuleError::NotOwner => self.err_not_owner,
+            RuleError::NotSent => self.err_not_sent,
+            RuleError::AlreadyMarked => self.err_already_marked,
+            RuleError::NoProposal => self.err_no_proposal,
+            RuleError::AlreadyApproved => self.err_already_approved,
+            RuleError::InvalidAmount => self.err_amount,
         }
     }
 

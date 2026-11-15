@@ -190,8 +190,9 @@ fn event_line(
     }
 }
 
-/// The dashboard body: banner (admin), totals, task list.
-pub(super) fn dashboard(ctx: &Ctx<'_>, ledger: &Ledger) -> Markup {
+/// The dashboard body: banner (admin), totals, task list. `error` puts
+/// a rejection message under one occurrence's row (plain form posts).
+pub(super) fn dashboard(ctx: &Ctx<'_>, ledger: &Ledger, error: Option<(usize, &str)>) -> Markup {
     let m = ctx.m;
     let by_occ = debt_by_occurrence(ledger);
     let occ = ledger.occurrences();
@@ -212,7 +213,9 @@ pub(super) fn dashboard(ctx: &Ctx<'_>, ledger: &Ledger) -> Markup {
                     p.at-muted { (m.no_tasks) }
                 } @else {
                     ul.at-list {
-                        @for o in order { (row(ctx, ledger, o, by_occ[o], None)) }
+                        @for o in order {
+                            (row(ctx, ledger, o, by_occ[o], error.filter(|e| e.0 == o).map(|e| e.1)))
+                        }
                     }
                 }
             }
