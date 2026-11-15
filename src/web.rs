@@ -95,6 +95,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/logout", post(handlers::logout))
         .route("/settings", get(settings::settings))
         .route("/lang", post(settings::set_lang))
+        .route("/email", post(settings::set_email))
         .route("/invite", post(links::create_invite))
         .route("/invite/{token}", get(links::accept_form).post(links::accept))
         .route("/reset", get(links::reset_request_form).post(links::reset_request))
@@ -902,5 +903,84 @@ mod tests {
         }
         let failed = h.post("/login", None, &[("email", "worker@atomanja.test"), ("password", "nope nope")]).await;
         assert!(failed.body.contains(r#"<html lang="fr""#), "even for an English account");
+    }
+
+    // web-review
+    #[tokio::test]
+    async fn app_29_owner_changes_own_email_only() {
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| {
+            testkit::account_with_password(s, "app29-worker@atomanja.test", "worker pass", Role::Worker)
+        });
+        let witness = h.ledger(|s| testkit::account(s, "app29-witness@atomanja.test", Role::Witness));
+        let cw = h.ledger(|s| testkit::session(s, &worker));
+        let cv = h.ledger(|s| testkit::session(s, &witness));
+
+        let page = h.get("/settings", Some(&cw)).await;
+        assert!(page.body.contains(r#"action="/email""#), "settings offers the field: {}", page.body);
+        assert!(page.body.contains(r#"name="new_email""#) && page.body.contains(r#"value="app29-worker@atomanja.test""#));
+
+        // The owner changes their own address and logs in with it.
+        let ok = h.post("/email", Some(&cw), &[("new_email", "app29-new@atomanja.test")]).await;
+        assert_eq!(ok.status, 303, "{}", ok.body);
+        assert_eq!(h.ledger(|s| s.account(worker.id).unwrap()).unwrap().email, "app29-new@atomanja.test");
+        let login = h
+            .post("/login", None, &[("email", "app29-new@atomanja.test"), ("password", "worker pass")])
+            .await;
+        assert_eq!(login.status, 303);
+
+        // A taken address is a field error; nothing changes.
+        let taken = h.post("/email", Some(&cv), &[("new_email", "app29-new@atomanja.test")]).await;
+        assert_eq!(taken.status, 400, "{}", taken.body);
+        assert!(taken.body.contains("Cette adresse a déjà un compte."), "{}", taken.body);
+        let hx_taken = h.hx_post("/email", Some(&cv), &[("new_email", "app29-new@atomanja.test")]).await;
+        assert_eq!(hx_taken.status, 400);
+        assert!(!hx_taken.body.contains("<html"), "htmx gets a fragment");
+        assert_eq!(h.ledger(|s| s.account(witness.id).unwrap()).unwrap().email, "app29-witness@atomanja.test");
+        let empty = h.post("/email", Some(&cv), &[("new_email", "  ")]).await;
+        assert_eq!(empty.status, 400);
+
+        // A request can only ever name the actor's own account: the
+        // witness changing theirs leaves the worker's untouched.
+        let own = h.post("/email", Some(&cv), &[("new_email", "app29-w2@atomanja.test")]).await;
+        assert_eq!(own.status, 303);
+        assert_eq!(h.ledger(|s| s.account(witness.id).unwrap()).unwrap().email, "app29-w2@atomanja.test");
+        assert_eq!(h.ledger(|s| s.account(worker.id).unwrap()).unwrap().email, "app29-new@atomanja.test");
+
+        assert_eq!(h.post("/email", None, &[("new_email", "x@atomanja.test")]).await.status, 303, "anonymous: to login");
+    }
+
+    #[tokio::test]
+    async fn web_review_reset_answers_before_smtp() {
+        // Mail to `slow-smtp*` stalls in the outbox (tests only), like a
+        // dead SMTP server; the answer must not wait for it (APP-28).
+        let h = Harness::start().await;
+        let email = "slow-smtp-reset@atomanja.test";
+        h.ledger(|s| testkit::account(s, email, Role::Worker));
+        let start = std::time::Instant::now();
+        let r = h.post("/reset", None, &[("email", email)]).await;
+        let known = start.elapsed();
+        assert_eq!(r.status, 200);
+        assert!(known < std::time::Duration::from_secs(1), "answered after {known:?}");
+        assert_eq!(super::outbox::sent_to(email).len(), 1, "the mail still goes out");
+    }
+
+    #[tokio::test]
+    async fn web_review_login_unknown_email_costs_like_known() {
+        let h = Harness::start().await;
+        h.ledger(|s| {
+            testkit::account_with_password(s, "timing@atomanja.test", "correct horse", Role::Worker)
+        });
+        let mut known = std::time::Duration::MAX;
+        let mut unknown = std::time::Duration::MAX;
+        for _ in 0..3 {
+            for (email, best) in [("timing@atomanja.test", &mut known), ("timing-nobody@atomanja.test", &mut unknown)] {
+                let start = std::time::Instant::now();
+                let r = h.post("/login", None, &[("email", email), ("password", "wrong horse")]).await;
+                assert_eq!(r.status, 401);
+                *best = (*best).min(start.elapsed());
+            }
+        }
+        assert!(unknown * 3 >= known, "unknown {unknown:?} vs known {known:?}: account probing by timing");
     }
 }

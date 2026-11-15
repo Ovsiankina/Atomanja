@@ -113,7 +113,7 @@ pub(super) async fn create_invite(
             Ok(a) => a,
             Err(e) => return internal(&e),
         };
-        settings::account_panel(m, &accounts, &actor.account, Some(&outcome)).into_response()
+        settings::account_panel(m, &accounts, &actor.account, Some(&outcome), None).into_response()
     } else {
         settings::render(&state, &actor.account, Some(&outcome), None)
     }
@@ -313,10 +313,11 @@ pub(super) async fn reset_request(
             let url = link(&state, "reset", &token);
             let expires = now() + TokenKind::Reset.lifetime();
             let mail = mail::reset(&account.email, &url, expires, account.lang);
-            // DECISION: the answer does not say whether the mail left, so
-            // the page is identical for known and unknown addresses; the
-            // failure is logged by `deliver` (SRS 5.1).
-            outbox::deliver(&state, mail).await;
+            // DECISION: the mail leaves in the background and the answer
+            // never says whether it did, so the page and its timing are the
+            // same for known and unknown addresses; a failure is logged by
+            // the outbox (SRS 5.1).
+            outbox::deliver_later(&state, mail);
         }
         Ok(None) => {}
         Err(e) => return internal(&e),

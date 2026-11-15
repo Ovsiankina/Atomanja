@@ -140,20 +140,24 @@ pub(super) async fn login(State(state): State<AppState>, Form(f): Form<LoginForm
             .map(|a| a.filter(|a| a.role == Role::Admin).map(|a| (a, Database::Dev))),
         other => other,
     };
-    let (account, home) = match found {
-        Ok(Some(found)) => found,
-        Ok(None) => return rejected(&email),
+    let found = match found {
+        Ok(found) => found,
         Err(e) => return internal(&e),
     };
-    let hash = account.password_hash.clone();
+    let stored = found.as_ref().map(|(a, _)| a.password_hash.clone());
     let password = f.password;
-    // argon2 is slow on purpose: keep it off the async workers.
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(&hash, &password))
-        .await
-        .unwrap_or(false);
-    if !ok {
+    // argon2 is slow on purpose: keep it off the async workers. An
+    // unknown address is checked against a dummy hash, so both answers
+    // cost one argon2 run (no account probing by timing).
+    let ok = tokio::task::spawn_blocking(move || {
+        let matches = auth::verify_password(stored.as_ref().unwrap_or_else(|| dummy_hash()), &password);
+        matches && stored.is_some()
+    })
+    .await
+    .unwrap_or(false);
+    let Some((account, home)) = found.filter(|_| ok) else {
         return rejected(&email);
-    }
+    };
     let token = match home {
         Database::Ledger => session::open_session(&mut *lock(&state.ledger), &account),
         Database::Dev => session::open_session(&mut *lock(&state.dev), &account),
@@ -167,6 +171,17 @@ pub(super) async fn login(State(state): State<AppState>, Form(f): Form<LoginForm
         }
         Err(e) => internal(&e),
     }
+}
+
+/// A hash no password matches in practice, built once with the same
+/// argon2 parameters as real accounts.
+// DECISION: hashed at first use from a fixed string rather than stored
+// as a literal, so its cost always follows `auth::hash_password`.
+fn dummy_hash() -> &'static auth::PasswordHash {
+    static DUMMY: std::sync::OnceLock<auth::PasswordHash> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        auth::hash_password("atomanja-no-such-account").unwrap_or(auth::PasswordHash(String::new()))
+    })
 }
 
 /// 401 with the login form and one error for both unknown email and

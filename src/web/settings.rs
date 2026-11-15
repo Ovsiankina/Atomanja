@@ -1,4 +1,5 @@
-//! The settings screen: accounts and invite link (APP-26), amount
+//! The settings screen: accounts and invite link (APP-26), own email
+//! (APP-29), amount
 //! proposal (APP-16), language (APP-39), notifications (APP-33).
 
 use axum::extract::{Form, State};
@@ -10,7 +11,7 @@ use serde::Deserialize;
 use super::handlers::{page, require};
 use super::i18n::{msgs, Msgs};
 use super::pages::{self, Field, Variant};
-use super::session::{internal, lock, see_other};
+use super::session::{self, internal, lock, see_other};
 use super::{pwa, AppState};
 use crate::auth::{self, Account, Action, Database, Role};
 use crate::config::Lang;
@@ -76,7 +77,7 @@ fn body<K: Kind>(
                 div.page__pinned { (pages::banner(true, m.fake_label, m.fake_text)) }
             }
             (pages::section(1, m.amount_per_task, &amount_block(m, &ledger, &accounts, account, amount_error)))
-            (pages::section(2, m.accounts, &account_panel(m, &accounts, account, invite)))
+            (pages::section(2, m.accounts, &account_panel(m, &accounts, account, invite, None)))
         }
     })
 }
@@ -124,6 +125,85 @@ pub(super) async fn set_lang(
     match done {
         Ok(()) => see_other("/settings"),
         Err(e) => internal(&e),
+    }
+}
+
+/// The email form field.
+#[derive(Deserialize)]
+pub(super) struct EmailForm {
+    #[serde(default)]
+    new_email: String,
+}
+
+/// `POST /email`: the account owner changes their own address, in the
+/// file that holds the account (APP-29, DEV-3). The form names no
+/// account: the actor can only ever change their own.
+///
+/// DECISION: a taken address is checked in the actor's own file only;
+/// reading the other file would break DEV-3 for the admin.
+pub(super) async fn set_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<EmailForm>,
+) -> Response {
+    let actor = match require(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let m = msgs(actor.account.lang);
+    let me = &actor.account;
+    if !auth::permits(me, Action::ChangeEmail(me.id)) {
+        return (StatusCode::FORBIDDEN, m.err_forbidden).into_response();
+    }
+    let email = f.new_email.trim();
+    let refused = |error: &str| -> Response {
+        let err = EmailError { value: email, error };
+        let accounts = match actor.home {
+            Database::Ledger => lock(&state.ledger).accounts(),
+            Database::Dev => lock(&state.dev).accounts(),
+        };
+        let accounts = match accounts {
+            Ok(a) => a,
+            Err(e) => return internal(&e),
+        };
+        let panel = account_panel(m, &accounts, me, None, Some(&err));
+        if session::is_htmx(&headers) {
+            (StatusCode::BAD_REQUEST, panel).into_response()
+        } else {
+            let content = html! { div.page__stack data-view="settings" { (pages::section(2, m.accounts, &panel)) } };
+            let mut r = page(m, m.nav_settings, "settings", &content);
+            *r.status_mut() = StatusCode::BAD_REQUEST;
+            r
+        }
+    };
+    if email.is_empty() {
+        return refused(m.err_email_empty);
+    }
+    if email == me.email {
+        return see_other("/settings");
+    }
+    let done = match actor.home {
+        Database::Ledger => change_email(&mut *lock(&state.ledger), me, email),
+        Database::Dev => change_email(&mut *lock(&state.dev), me, email),
+    };
+    match done {
+        Ok(true) => see_other("/settings"),
+        Ok(false) => refused(m.err_email_taken),
+        Err(e) => internal(&e),
+    }
+}
+
+/// Set the address of `me` in `store`; `false` when another account
+/// already has it.
+fn change_email<K: Kind>(store: &mut Store<K>, me: &Account, email: &str) -> Result<bool, StoreError> {
+    // One lock for check and write; the unique index still refuses a race.
+    if store.account_by_email(email)?.is_some() {
+        return Ok(false);
+    }
+    match store.set_email(me.id, email) {
+        Ok(()) => Ok(true),
+        Err(StoreError::Conflict) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -206,13 +286,21 @@ pub(super) fn amount_block(
     }
 }
 
-/// The `AccountPanel`: the one worker, the witnesses, and for the worker
-/// the invite block. Its `id` is the htmx target of `POST /invite`.
+/// A refused email change: the address typed and why it was refused.
+pub(super) struct EmailError<'a> {
+    pub value: &'a str,
+    pub error: &'a str,
+}
+
+/// The `AccountPanel`: the one worker, the witnesses, the actor's own
+/// email form (APP-29), and for the worker the invite block. Its `id` is
+/// the htmx target of `POST /invite` and `POST /email`.
 pub(super) fn account_panel(
     m: &Msgs,
     accounts: &[Account],
     me: &Account,
     invite: Option<&InviteOutcome>,
+    email_error: Option<&EmailError<'_>>,
 ) -> Markup {
     html! {
         div.at-account id="accounts" {
@@ -238,6 +326,14 @@ pub(super) fn account_panel(
                             Role::Admin => m.sees_fake,
                         }) }
                     }
+                }
+            }
+            @if auth::permits(me, Action::ChangeEmail(me.id)) {
+                form.page__form method="post" action="/email" hx-post="/email" hx-target="#accounts" hx-swap="outerHTML" {
+                    (Field { value: email_error.map_or(me.email.as_str(), |e| e.value),
+                             error: email_error.map(|e| e.error),
+                             ..Field::new(m.my_email, "new_email", "email", "email") }.render())
+                    (pages::button(m.change_email, Variant::Outline, false, false, Some("→")))
                 }
             }
             @if auth::permits(me, Action::CreateInvite) {

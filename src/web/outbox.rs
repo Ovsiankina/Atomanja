@@ -16,7 +16,26 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) async fn deliver(state: &AppState, email: Email) -> bool {
     #[cfg(test)]
     record(&email);
-    match tokio::time::timeout(SEND_TIMEOUT, state.mailer.send(&email)).await {
+    transmit(state, &email).await
+}
+
+/// Send `email` in the background and return at once; a failure is
+/// only logged. For answers that must not reveal, by content or by
+/// timing, whether a mail was sent (APP-28: no account probing).
+pub(super) fn deliver_later(state: &AppState, email: Email) {
+    #[cfg(test)]
+    record(&email);
+    let state = state.clone();
+    tokio::spawn(async move {
+        transmit(&state, &email).await;
+    });
+}
+
+/// Hand `email` to SMTP, bounded by [`SEND_TIMEOUT`].
+async fn transmit(state: &AppState, email: &Email) -> bool {
+    #[cfg(test)]
+    stall(email).await;
+    match tokio::time::timeout(SEND_TIMEOUT, state.mailer.send(email)).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
             eprintln!("web: email to {} not sent: {e}", email.to);
@@ -38,6 +57,15 @@ static SENT: std::sync::Mutex<Vec<Email>> = std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 fn record(email: &Email) {
     super::session::lock(&SENT).push(email.clone());
+}
+
+// DECISION: mail to a `slow-smtp*` address stalls for 3 s before the
+// send, standing in for a dead SMTP server in timing tests.
+#[cfg(test)]
+async fn stall(email: &Email) {
+    if email.to.starts_with("slow-smtp") {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 }
 
 /// Every email handed to [`deliver`] for `to`, oldest first (tests only;
