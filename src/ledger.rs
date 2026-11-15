@@ -380,6 +380,8 @@ fn idx(id: u32) -> usize {
 /// Changes being built by one [`Ledger::observe`] call, with the row ids
 /// they have claimed so far.
 struct Batch {
+    /// The single real witness, when there is exactly one (APP-17).
+    auto_owner: Option<WitnessId>,
     out: Vec<Change>,
     next_occ: u32,
     next_debt: u32,
@@ -388,10 +390,10 @@ struct Batch {
 impl Batch {
     /// A task seen without a current occurrence (APP-4, APP-5).
     fn first_sight(&mut self, o: &Observation, now: Timestamp) {
-        if let Some(due) = tracked_due(o) {
-            if due > now {
-                self.record(o, due, now);
-            }
+        if let Some(due) = tracked_due(o)
+            && due > now
+        {
+            self.record(o, due, now);
         }
     }
 
@@ -399,11 +401,28 @@ impl Batch {
     /// A late one gets its single debt at `amount` (APP-11, APP-12).
     fn decide(&mut self, occurrence: OccurrenceId, met: bool, amount: Centimes, now: Timestamp) {
         let outcome = if met { Outcome::Met } else { Outcome::Late };
-        self.out.push(Change::Decided { occurrence, outcome, at: now });
+        self.out.push(Change::Decided {
+            occurrence,
+            outcome,
+            at: now,
+        });
         if !met {
             let debt = DebtId(self.next_debt);
             self.next_debt += 1;
-            self.out.push(Change::DebtCreated { debt, occurrence, amount, at: now });
+            self.out.push(Change::DebtCreated {
+                debt,
+                occurrence,
+                amount,
+                at: now,
+            });
+            if let Some(witness) = self.auto_owner {
+                self.out.push(Change::Claimed {
+                    debt,
+                    witness,
+                    automatic: true,
+                    at: now,
+                });
+            }
         }
     }
 
@@ -411,9 +430,18 @@ impl Batch {
     fn record(&mut self, o: &Observation, deadline: Timestamp, now: Timestamp) {
         let occurrence = OccurrenceId(self.next_occ);
         self.next_occ += 1;
-        self.out.push(Change::Recorded { occurrence, task: o.task, deadline, at: now });
+        self.out.push(Change::Recorded {
+            occurrence,
+            task: o.task,
+            deadline,
+            at: now,
+        });
         if o.done {
-            self.out.push(Change::SeenDone { occurrence, done: true, at: now });
+            self.out.push(Change::SeenDone {
+                occurrence,
+                done: true,
+                at: now,
+            });
         }
     }
 }
@@ -433,7 +461,12 @@ impl Ledger {
     /// change is persisted and when loading from disk (DB-3).
     pub fn apply(&mut self, change: &Change) {
         match *change {
-            Change::Recorded { occurrence, task, deadline, at } => {
+            Change::Recorded {
+                occurrence,
+                task,
+                deadline,
+                at,
+            } => {
                 debug_assert_eq!(idx(occurrence.0), self.occurrences.task.len());
                 self.occurrences.deadline.push(deadline);
                 self.occurrences.task.push(task);
@@ -443,7 +476,12 @@ impl Ledger {
                 self.tracking.last_seen.push(Seen::Due(deadline));
                 self.current.insert(task, occurrence);
             }
-            Change::Event { occurrence, kind, new_due, at } => {
+            Change::Event {
+                occurrence,
+                kind,
+                new_due,
+                at,
+            } => {
                 let i = idx(occurrence.0);
                 self.events.new_due.push(new_due);
                 self.events.at.push(at);
@@ -458,19 +496,29 @@ impl Ledger {
                 // pending one follows an earlier due date (APP-7, APP-10).
                 if kind == EventKind::MovedEarlier
                     && self.occurrences.outcome[i] == Outcome::Pending
+                    && let Some(d) = new_due
                 {
-                    if let Some(d) = new_due {
-                        self.occurrences.deadline[i] = d;
-                    }
+                    self.occurrences.deadline[i] = d;
                 }
             }
-            Change::SeenDone { occurrence, done, .. } => {
+            Change::SeenDone {
+                occurrence, done, ..
+            } => {
                 self.tracking.seen_done[idx(occurrence.0)] = done;
             }
-            Change::Decided { occurrence, outcome, .. } => {
+            Change::Decided {
+                occurrence,
+                outcome,
+                ..
+            } => {
                 self.occurrences.outcome[idx(occurrence.0)] = outcome;
             }
-            Change::DebtCreated { debt, occurrence, amount, at } => {
+            Change::DebtCreated {
+                debt,
+                occurrence,
+                amount,
+                at,
+            } => {
                 debug_assert_eq!(idx(debt.0), self.debts.occurrence.len());
                 self.debts.owner.push(None);
                 self.debts.sent_at.push(None);
@@ -480,7 +528,11 @@ impl Ledger {
                 self.debts.amount.push(amount);
             }
             Change::AmountProposed { amount, at } => {
-                self.proposal = Some(Proposal { amount, proposed_at: at, approvals: Vec::new() });
+                self.proposal = Some(Proposal {
+                    amount,
+                    proposed_at: at,
+                    approvals: Vec::new(),
+                });
             }
             Change::AmountApproved { witness, .. } => {
                 if let Some(p) = self.proposal.as_mut() {
@@ -491,7 +543,15 @@ impl Ledger {
                 self.amounts.push((at, amount));
                 self.proposal = None;
             }
-            _ => todo!(),
+            Change::Claimed { debt, witness, .. } => {
+                self.debts.owner[idx(debt.0)] = Some(witness);
+            }
+            Change::MarkedSent { debt, at } => {
+                self.debts.sent_at[idx(debt.0)] = Some(at);
+            }
+            Change::MarkedReceived { debt, at } => {
+                self.debts.received_at[idx(debt.0)] = Some(at);
+            }
         }
     }
 
@@ -507,8 +567,11 @@ impl Ledger {
         now: Timestamp,
         real_witnesses: &[WitnessId],
     ) -> Vec<Change> {
-        let _ = real_witnesses;
         let mut batch = Batch {
+            auto_owner: match real_witnesses {
+                [only] => Some(*only),
+                _ => None,
+            },
             out: Vec::new(),
             next_occ: next_id(self.occurrences.task.len()),
             next_debt: next_id(self.debts.occurrence.len()),
@@ -571,27 +634,26 @@ impl Ledger {
             Some(o) => o.due.map_or(Seen::NoDue, Seen::Due),
         };
         let changed = seen != self.tracking.last_seen[i];
-        if let (true, Some(o), Seen::Due(new_due)) = (changed, o, seen) {
-            if self.is_advance(i, o) {
-                if self.occurrences.outcome[i] == Outcome::Pending {
-                    // The mark-done that advanced it is the done proof.
-                    let met = o.done_at.is_some_and(|d| d <= recorded)
-                        || self.tracking.seen_done[i];
-                    batch.decide(occ, met, self.amount_at(recorded), now);
-                }
-                // DECISION: a new occurrence whose due date is already past
-                // when first seen is not recorded, as APP-5 says for any
-                // first sight; the closed one stays current until the next
-                // advance into the future.
-                if new_due > now {
-                    batch.record(o, new_due, now);
-                }
-                return;
+        if let (true, Some(o), Seen::Due(new_due)) = (changed, o, seen)
+            && self.is_advance(i, o)
+        {
+            if self.occurrences.outcome[i] == Outcome::Pending {
+                // The mark-done that advanced it is the done proof.
+                let met = o.done_at.is_some_and(|d| d <= recorded) || self.tracking.seen_done[i];
+                batch.decide(occ, met, self.amount_at(recorded), now);
             }
+            // DECISION: a new occurrence whose due date is already past
+            // when first seen is not recorded, as APP-5 says for any
+            // first sight; the closed one stays current until the next
+            // advance into the future.
+            if new_due > now {
+                batch.record(o, new_due, now);
+            }
+            return;
         }
         let pending = self.occurrences.outcome[i] == Outcome::Pending;
         let mut deadline = recorded;
-        let mut seen_done = self.tracking.seen_done[i];
+        let seen_done = self.tracking.seen_done[i];
         let visible = o.filter(|o| !o.archived);
         if changed {
             let (kind, new_due) = match seen {
@@ -607,7 +669,12 @@ impl Ledger {
             if kind == EventKind::MovedEarlier && pending {
                 deadline = new_due.unwrap_or(recorded);
             }
-            batch.out.push(Change::Event { occurrence: occ, kind, new_due, at: now });
+            batch.out.push(Change::Event {
+                occurrence: occ,
+                kind,
+                new_due,
+                at: now,
+            });
         }
         if !pending {
             return;
@@ -615,11 +682,14 @@ impl Ledger {
         if now <= deadline {
             // DECISION: a task that vanished or was archived shows no done
             // flag, so the last one seen before it went is kept (APP-9).
-            if let Some(o) = visible {
-                if o.done != seen_done {
-                    seen_done = o.done;
-                    batch.out.push(Change::SeenDone { occurrence: occ, done: o.done, at: now });
-                }
+            if let Some(o) = visible
+                && o.done != seen_done
+            {
+                batch.out.push(Change::SeenDone {
+                    occurrence: occ,
+                    done: o.done,
+                    at: now,
+                });
             }
             return;
         }
@@ -628,7 +698,12 @@ impl Ledger {
         // Vikunja always stamps it, so this only guards odd data.
         let done_in_time =
             visible.is_some_and(|o| o.done && o.done_at.is_some_and(|d| d <= deadline));
-        batch.decide(occ, done_in_time || seen_done, self.amount_at(deadline), now);
+        batch.decide(
+            occ,
+            done_in_time || seen_done,
+            self.amount_at(deadline),
+            now,
+        );
     }
 
     /// A real witness claims an unclaimed debt (APP-18, APP-19, APP-20).
@@ -643,8 +718,29 @@ impl Ledger {
         real_witnesses: &[WitnessId],
         now: Timestamp,
     ) -> Result<Change, RuleError> {
-        let _ = (debt, witness, real_witnesses, now);
-        todo!()
+        let i = self.debt_index(debt)?;
+        if !real_witnesses.contains(&witness) {
+            return Err(RuleError::NotRealWitness);
+        }
+        if self.debts.owner[i].is_some() {
+            return Err(RuleError::AlreadyClaimed);
+        }
+        Ok(Change::Claimed {
+            debt,
+            witness,
+            automatic: false,
+            at: now,
+        })
+    }
+
+    /// Row of a known debt.
+    fn debt_index(&self, debt: DebtId) -> Result<usize, RuleError> {
+        let i = idx(debt.0);
+        if i < self.debts.occurrence.len() {
+            Ok(i)
+        } else {
+            Err(RuleError::UnknownDebt)
+        }
     }
 
     /// The worker marks a claimed debt as sent. The caller has checked
@@ -654,8 +750,14 @@ impl Ledger {
     ///
     /// `UnknownDebt`, `NotClaimed`, `AlreadyMarked`.
     pub fn mark_sent(&self, debt: DebtId, now: Timestamp) -> Result<Change, RuleError> {
-        let _ = (debt, now);
-        todo!()
+        let i = self.debt_index(debt)?;
+        if self.debts.owner[i].is_none() {
+            return Err(RuleError::NotClaimed);
+        }
+        if self.debts.sent_at[i].is_some() {
+            return Err(RuleError::AlreadyMarked);
+        }
+        Ok(Change::MarkedSent { debt, at: now })
     }
 
     /// The owner witness marks a sent debt as received (APP-22, APP-23).
@@ -669,8 +771,17 @@ impl Ledger {
         witness: WitnessId,
         now: Timestamp,
     ) -> Result<Change, RuleError> {
-        let _ = (debt, witness, now);
-        todo!()
+        let i = self.debt_index(debt)?;
+        if self.debts.owner[i] != Some(witness) {
+            return Err(RuleError::NotOwner);
+        }
+        if self.debts.sent_at[i].is_none() {
+            return Err(RuleError::NotSent);
+        }
+        if self.debts.received_at[i].is_some() {
+            return Err(RuleError::AlreadyMarked);
+        }
+        Ok(Change::MarkedReceived { debt, at: now })
     }
 
     /// The worker proposes a new amount (APP-16). The caller has checked
@@ -714,19 +825,40 @@ impl Ledger {
             .iter()
             .all(|w| *w == witness || p.approvals.contains(w));
         if all {
-            out.push(Change::AmountInForce { amount: p.amount, at: now });
+            out.push(Change::AmountInForce {
+                amount: p.amount,
+                at: now,
+            });
         }
         Ok(out)
     }
 
     /// Owed, sent and confirmed totals (APP-24).
     pub fn totals(&self) -> Totals {
-        todo!()
+        // DECISION: saturating sums; u32 centimes cap at ~42.9M CHF, far
+        // past any real total, and a capped figure beats a panic in a view.
+        let sum = |keep: &dyn Fn(usize) -> bool| {
+            let total = self
+                .debts
+                .amount
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| keep(i))
+                .fold(0u32, |acc, (_, a)| acc.saturating_add(a.0));
+            Centimes(total)
+        };
+        Totals {
+            owed: sum(&|_| true),
+            sent: sum(&|i| self.debts.sent_at[i].is_some()),
+            confirmed: sum(&|i| self.debts.received_at[i].is_some()),
+        }
     }
 
     /// The amount a debt created now would carry (APP-15, APP-16).
     pub fn amount(&self) -> Centimes {
-        self.amounts.last().map_or(Centimes::DEFAULT_AMOUNT, |&(_, a)| a)
+        self.amounts
+            .last()
+            .map_or(Centimes::DEFAULT_AMOUNT, |&(_, a)| a)
     }
 
     /// The pending amount proposal, if any (APP-16).
@@ -966,7 +1098,11 @@ mod tests {
         assert_eq!(
             changes,
             vec![
-                Change::Decided { occurrence: OccurrenceId(0), outcome: Outcome::Met, at: t(20) },
+                Change::Decided {
+                    occurrence: OccurrenceId(0),
+                    outcome: Outcome::Met,
+                    at: t(20)
+                },
                 Change::Recorded {
                     occurrence: OccurrenceId(1),
                     task: TaskId(1),
@@ -1036,11 +1172,20 @@ mod tests {
         // marked done before its deadline and advanced; done is false
         // again, only done_at shows it.
         let now = DAY + 5 * HOUR;
-        let changes = poll(&mut l, &snap(vec![daily(1, 2 * DAY, Some(DAY - HOUR))]), now, &[]);
+        let changes = poll(
+            &mut l,
+            &snap(vec![daily(1, 2 * DAY, Some(DAY - HOUR))]),
+            now,
+            &[],
+        );
         assert_eq!(
             changes,
             vec![
-                Change::Decided { occurrence: OccurrenceId(0), outcome: Outcome::Met, at: t(now) },
+                Change::Decided {
+                    occurrence: OccurrenceId(0),
+                    outcome: Outcome::Met,
+                    at: t(now)
+                },
                 Change::Recorded {
                     occurrence: OccurrenceId(1),
                     task: TaskId(1),
@@ -1057,7 +1202,11 @@ mod tests {
         changes
             .iter()
             .filter_map(|c| match *c {
-                Change::Decided { occurrence, outcome, at } => Some((occurrence, outcome, at)),
+                Change::Decided {
+                    occurrence,
+                    outcome,
+                    at,
+                } => Some((occurrence, outcome, at)),
                 _ => None,
             })
             .collect()
@@ -1067,8 +1216,16 @@ mod tests {
     fn app_9_done_before_deadline_is_met() {
         let mut l = Ledger::new();
         poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
-        let c = poll(&mut l, &snap(vec![done(obs(1, Some(DAY)), DAY - 10)]), DAY + 1, &[]);
-        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+        let c = poll(
+            &mut l,
+            &snap(vec![done(obs(1, Some(DAY)), DAY - 10)]),
+            DAY + 1,
+            &[],
+        );
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]
+        );
         assert_eq!(l.occurrences().outcome, vec![Outcome::Met]);
         assert!(l.debts().occurrence.is_empty());
     }
@@ -1076,7 +1233,12 @@ mod tests {
     #[test]
     fn app_9_done_after_deadline_is_late() {
         let mut l = Ledger::new();
-        poll(&mut l, &snap(vec![obs(1, Some(DAY)), obs(2, Some(DAY))]), 0, &[]);
+        poll(
+            &mut l,
+            &snap(vec![obs(1, Some(DAY)), obs(2, Some(DAY))]),
+            0,
+            &[],
+        );
         let s = snap(vec![done(obs(1, Some(DAY)), DAY + 10), obs(2, Some(DAY))]);
         let c = poll(&mut l, &s, DAY + 20, &[]);
         assert_eq!(
@@ -1095,10 +1257,17 @@ mod tests {
         let c = poll(&mut l, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
         assert_eq!(
             c,
-            vec![Change::SeenDone { occurrence: OccurrenceId(0), done: true, at: t(10) }]
+            vec![Change::SeenDone {
+                occurrence: OccurrenceId(0),
+                done: true,
+                at: t(10)
+            }]
         );
         let c = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY + 1, &[]);
-        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]
+        );
 
         // Seen done, then reopened before the deadline: the last
         // observation before the deadline is "open", so late.
@@ -1108,10 +1277,17 @@ mod tests {
         let c = poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 20, &[]);
         assert_eq!(
             c,
-            vec![Change::SeenDone { occurrence: OccurrenceId(0), done: false, at: t(20) }]
+            vec![Change::SeenDone {
+                occurrence: OccurrenceId(0),
+                done: false,
+                at: t(20)
+            }]
         );
         let c = poll(&mut m, &snap(vec![obs(1, Some(DAY))]), DAY + 1, &[]);
-        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Late, t(DAY + 1))]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Late, t(DAY + 1))]
+        );
     }
 
     #[test]
@@ -1119,7 +1295,10 @@ mod tests {
         let mut l = Ledger::new();
         poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
         let c = poll(&mut l, &snap(vec![]), DAY + 1, &[]);
-        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Late, t(DAY + 1))]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Late, t(DAY + 1))]
+        );
         assert_eq!(l.events().kind, vec![EventKind::Deleted]);
 
         // Deleted after being seen done before the deadline: met.
@@ -1128,14 +1307,20 @@ mod tests {
         poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
         poll(&mut m, &snap(vec![]), 20, &[]);
         let c = poll(&mut m, &snap(vec![]), DAY + 1, &[]);
-        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]
+        );
 
         // First seen already done, then deleted: the first sight counts as
         // an observation before the deadline.
         let mut f = Ledger::new();
         poll(&mut f, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
         let c = poll(&mut f, &snap(vec![]), DAY + 1, &[]);
-        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]
+        );
     }
 
     #[test]
@@ -1146,7 +1331,10 @@ mod tests {
         assert!(poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY, &[]).is_empty());
         // Next successful poll is ten days later (server or Vikunja down).
         let c = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 10 * DAY, &[]);
-        assert_eq!(decisions(&c), vec![(OccurrenceId(0), Outcome::Late, t(10 * DAY))]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Late, t(10 * DAY))]
+        );
     }
 
     #[test]
@@ -1156,14 +1344,24 @@ mod tests {
         poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY + 1, &[]);
         assert_eq!(l.occurrences().outcome, vec![Outcome::Late]);
         // Vikunja later claims it was done before the deadline.
-        let c = poll(&mut l, &snap(vec![done(obs(1, Some(DAY)), DAY - 1)]), DAY + 2, &[]);
+        let c = poll(
+            &mut l,
+            &snap(vec![done(obs(1, Some(DAY)), DAY - 1)]),
+            DAY + 2,
+            &[],
+        );
         assert!(decisions(&c).is_empty());
         assert!(!c.iter().any(|c| matches!(c, Change::SeenDone { .. })));
         assert_eq!(l.occurrences().outcome, vec![Outcome::Late]);
         // And a met one stays met when reopened and moved.
         let mut m = Ledger::new();
         poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
-        poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), DAY + 1, &[]);
+        poll(
+            &mut m,
+            &snap(vec![done(obs(1, Some(DAY)), 5)]),
+            DAY + 1,
+            &[],
+        );
         let c = poll(&mut m, &snap(vec![obs(1, Some(DAY - 5))]), DAY + 2, &[]);
         assert!(decisions(&c).is_empty());
         assert_eq!(m.occurrences().outcome, vec![Outcome::Met]);
@@ -1199,7 +1397,11 @@ mod tests {
         assert_eq!(
             c,
             vec![
-                Change::Decided { occurrence: OccurrenceId(0), outcome: Outcome::Late, at: t(DAY + 1) },
+                Change::Decided {
+                    occurrence: OccurrenceId(0),
+                    outcome: Outcome::Late,
+                    at: t(DAY + 1)
+                },
                 Change::DebtCreated {
                     debt: DebtId(0),
                     occurrence: OccurrenceId(0),
@@ -1263,22 +1465,50 @@ mod tests {
         let w = [A, B];
         let mut l = Ledger::new();
         assert_eq!(l.approve_amount(A, &w, t(1)), Err(RuleError::NoProposal));
-        assert_eq!(l.propose_amount(Centimes(0), t(1)), Err(RuleError::InvalidAmount));
-        assert_eq!(l.propose_amount(Centimes(1000), t(1)), Err(RuleError::InvalidAmount));
+        assert_eq!(
+            l.propose_amount(Centimes(0), t(1)),
+            Err(RuleError::InvalidAmount)
+        );
+        assert_eq!(
+            l.propose_amount(Centimes(1000), t(1)),
+            Err(RuleError::InvalidAmount)
+        );
 
         let p = l.propose_amount(Centimes(1500), t(2)).unwrap();
-        assert_eq!(p, Change::AmountProposed { amount: Centimes(1500), at: t(2) });
+        assert_eq!(
+            p,
+            Change::AmountProposed {
+                amount: Centimes(1500),
+                at: t(2)
+            }
+        );
         l.apply(&p);
-        assert_eq!(l.approve_amount(WitnessId(999), &w, t(3)), Err(RuleError::NotRealWitness));
+        assert_eq!(
+            l.approve_amount(WitnessId(999), &w, t(3)),
+            Err(RuleError::NotRealWitness)
+        );
 
         let c = l.approve_amount(A, &w, t(3)).unwrap();
-        assert_eq!(c, vec![Change::AmountApproved { witness: A, at: t(3) }]);
+        assert_eq!(
+            c,
+            vec![Change::AmountApproved {
+                witness: A,
+                at: t(3)
+            }]
+        );
         apply_all(&mut l, &c);
         assert_eq!(l.amount(), Centimes(1000));
-        assert_eq!(l.approve_amount(A, &w, t(4)), Err(RuleError::AlreadyApproved));
+        assert_eq!(
+            l.approve_amount(A, &w, t(4)),
+            Err(RuleError::AlreadyApproved)
+        );
         assert_eq!(
             l.proposal(),
-            Some(&Proposal { amount: Centimes(1500), proposed_at: t(2), approvals: vec![A] })
+            Some(&Proposal {
+                amount: Centimes(1500),
+                proposed_at: t(2),
+                approvals: vec![A]
+            })
         );
 
         // A new proposal replaces the old one and clears its approvals.
@@ -1291,8 +1521,14 @@ mod tests {
         assert_eq!(
             c,
             vec![
-                Change::AmountApproved { witness: B, at: t(7) },
-                Change::AmountInForce { amount: Centimes(1200), at: t(7) },
+                Change::AmountApproved {
+                    witness: B,
+                    at: t(7)
+                },
+                Change::AmountInForce {
+                    amount: Centimes(1200),
+                    at: t(7)
+                },
             ]
         );
         apply_all(&mut l, &c);
@@ -1304,28 +1540,337 @@ mod tests {
     fn app_16_new_amount_not_retroactive() {
         let w = [A];
         let mut l = Ledger::new();
-        poll(&mut l, &snap(vec![obs(1, Some(DAY)), obs(2, Some(3 * DAY))]), 0, &w);
+        poll(
+            &mut l,
+            &snap(vec![obs(1, Some(DAY)), obs(2, Some(3 * DAY))]),
+            0,
+            &w,
+        );
         set_amount(&mut l, 2500, 2 * DAY, &w);
         // Both decided late after the change; only task 2's deadline is
         // after the moment the new amount came into force.
-        poll(&mut l, &snap(vec![obs(1, Some(DAY)), obs(2, Some(3 * DAY))]), 4 * DAY, &w);
+        poll(
+            &mut l,
+            &snap(vec![obs(1, Some(DAY)), obs(2, Some(3 * DAY))]),
+            4 * DAY,
+            &w,
+        );
         assert_eq!(l.debts().occurrence, vec![OccurrenceId(0), OccurrenceId(1)]);
         assert_eq!(l.debts().amount, vec![Centimes(1000), Centimes(2500)]);
     }
 
     // ledger-06
-    #[test] fn app_17_single_witness_auto_claims() { todo!() }
-    #[test] fn app_18_zero_witnesses_leaves_claimable() { todo!() }
-    #[test] fn app_18_first_claim_wins_second_rejected() { todo!() }
-    #[test] fn app_19_unclaimed_counts_in_owed() { todo!() }
-    #[test] fn app_19_late_joiner_can_claim_old_debt() { todo!() }
-    #[test] fn app_20_admin_not_counted_as_real_witness() { todo!() }
-    #[test] fn app_21_only_claimed_debt_can_be_marked_sent() { todo!() }
-    #[test] fn app_22_received_only_by_owner_after_sent() { todo!() }
-    #[test] fn app_23_marks_cannot_be_unset() { todo!() }
-    #[test] fn app_24_totals_owed_sent_confirmed() { todo!() }
-    #[test] fn ledger_double_claim_same_witness_is_rejected_not_duplicated() { todo!() }
+    const C: WitnessId = WitnessId(300);
+    /// The admin witness's account id. Callers never pass it as real.
+    const ADMIN: WitnessId = WitnessId(1);
+
+    fn claimed(l: &mut Ledger, debt: u32, w: WitnessId, real: &[WitnessId], now: i64) {
+        let c = l.claim(DebtId(debt), w, real, t(now)).unwrap();
+        l.apply(&c);
+    }
+
+    #[test]
+    fn app_17_single_witness_auto_claims() {
+        let (l, c) = one_late_debt(&[A]);
+        assert_eq!(
+            c.last(),
+            Some(&Change::Claimed {
+                debt: DebtId(0),
+                witness: A,
+                automatic: true,
+                at: t(DAY + 1)
+            })
+        );
+        assert_eq!(l.debts().owner, vec![Some(A)]);
+    }
+
+    #[test]
+    fn app_18_zero_witnesses_leaves_claimable() {
+        for real in [&[][..], &[A, B][..]] {
+            let (mut l, c) = one_late_debt(real);
+            assert!(!c.iter().any(|c| matches!(c, Change::Claimed { .. })));
+            assert_eq!(l.debts().owner, vec![None]);
+            claimed(&mut l, 0, A, &[A, B], DAY + 2);
+            assert_eq!(l.debts().owner, vec![Some(A)]);
+        }
+    }
+
+    #[test]
+    fn app_18_first_claim_wins_second_rejected() {
+        let w = [A, B];
+        let (mut l, _) = one_late_debt(&w);
+        let c = l.claim(DebtId(0), A, &w, t(DAY + 2)).unwrap();
+        assert_eq!(
+            c,
+            Change::Claimed {
+                debt: DebtId(0),
+                witness: A,
+                automatic: false,
+                at: t(DAY + 2)
+            }
+        );
+        l.apply(&c);
+        assert_eq!(
+            l.claim(DebtId(0), B, &w, t(DAY + 3)),
+            Err(RuleError::AlreadyClaimed)
+        );
+        assert_eq!(
+            l.claim(DebtId(5), B, &w, t(DAY + 3)),
+            Err(RuleError::UnknownDebt)
+        );
+        assert_eq!(l.debts().owner, vec![Some(A)]);
+    }
+
+    #[test]
+    fn app_19_unclaimed_counts_in_owed() {
+        let (l, _) = one_late_debt(&[A, B]);
+        assert_eq!(
+            l.totals(),
+            Totals {
+                owed: Centimes(1000),
+                sent: Centimes(0),
+                confirmed: Centimes(0)
+            }
+        );
+    }
+
+    #[test]
+    fn app_19_late_joiner_can_claim_old_debt() {
+        let (mut l, _) = one_late_debt(&[A, B]);
+        // C joins a year later; the debt is still claimable.
+        assert_eq!(
+            l.claim(DebtId(0), C, &[A, B], t(400 * DAY)),
+            Err(RuleError::NotRealWitness)
+        );
+        claimed(&mut l, 0, C, &[A, B, C], 400 * DAY);
+        assert_eq!(l.debts().owner, vec![Some(C)]);
+    }
+
+    #[test]
+    fn app_20_admin_not_counted_as_real_witness() {
+        // The caller passes real witnesses only: A plus the admin is one.
+        let (mut l, _) = one_late_debt(&[A]);
+        assert_eq!(l.debts().owner, vec![Some(A)]);
+        assert_eq!(
+            l.claim(DebtId(0), ADMIN, &[A], t(DAY + 2)),
+            Err(RuleError::NotRealWitness)
+        );
+        l.apply(&l.mark_sent(DebtId(0), t(DAY + 3)).unwrap());
+        assert_eq!(
+            l.mark_received(DebtId(0), ADMIN, t(DAY + 4)),
+            Err(RuleError::NotOwner)
+        );
+        let p = l.propose_amount(Centimes(2000), t(DAY + 5)).unwrap();
+        l.apply(&p);
+        assert_eq!(
+            l.approve_amount(ADMIN, &[A], t(DAY + 6)),
+            Err(RuleError::NotRealWitness)
+        );
+    }
+
+    #[test]
+    fn app_21_only_claimed_debt_can_be_marked_sent() {
+        let w = [A, B];
+        let (mut l, _) = one_late_debt(&w);
+        assert_eq!(
+            l.mark_sent(DebtId(0), t(DAY + 2)),
+            Err(RuleError::NotClaimed)
+        );
+        assert_eq!(
+            l.mark_sent(DebtId(1), t(DAY + 2)),
+            Err(RuleError::UnknownDebt)
+        );
+        claimed(&mut l, 0, B, &w, DAY + 3);
+        let c = l.mark_sent(DebtId(0), t(DAY + 4)).unwrap();
+        assert_eq!(
+            c,
+            Change::MarkedSent {
+                debt: DebtId(0),
+                at: t(DAY + 4)
+            }
+        );
+        l.apply(&c);
+        assert_eq!(l.debts().sent_at, vec![Some(t(DAY + 4))]);
+    }
+
+    #[test]
+    fn app_22_received_only_by_owner_after_sent() {
+        let w = [A, B];
+        let (mut l, _) = one_late_debt(&w);
+        assert_eq!(
+            l.mark_received(DebtId(0), A, t(DAY + 2)),
+            Err(RuleError::NotOwner)
+        );
+        assert_eq!(
+            l.mark_received(DebtId(9), A, t(DAY + 2)),
+            Err(RuleError::UnknownDebt)
+        );
+        claimed(&mut l, 0, A, &w, DAY + 3);
+        assert_eq!(
+            l.mark_received(DebtId(0), A, t(DAY + 4)),
+            Err(RuleError::NotSent)
+        );
+        l.apply(&l.mark_sent(DebtId(0), t(DAY + 5)).unwrap());
+        assert_eq!(
+            l.mark_received(DebtId(0), B, t(DAY + 6)),
+            Err(RuleError::NotOwner)
+        );
+        let c = l.mark_received(DebtId(0), A, t(DAY + 7)).unwrap();
+        assert_eq!(
+            c,
+            Change::MarkedReceived {
+                debt: DebtId(0),
+                at: t(DAY + 7)
+            }
+        );
+        l.apply(&c);
+        assert_eq!(l.debts().received_at, vec![Some(t(DAY + 7))]);
+    }
+
+    #[test]
+    fn app_23_marks_cannot_be_unset() {
+        let (mut l, _) = one_late_debt(&[A]);
+        l.apply(&l.mark_sent(DebtId(0), t(DAY + 2)).unwrap());
+        assert_eq!(
+            l.mark_sent(DebtId(0), t(DAY + 3)),
+            Err(RuleError::AlreadyMarked)
+        );
+        l.apply(&l.mark_received(DebtId(0), A, t(DAY + 4)).unwrap());
+        assert_eq!(
+            l.mark_received(DebtId(0), A, t(DAY + 5)),
+            Err(RuleError::AlreadyMarked)
+        );
+        // Later polls never touch the marks either.
+        poll(&mut l, &snap(vec![]), DAY + 6, &[A]);
+        assert_eq!(l.debts().sent_at, vec![Some(t(DAY + 2))]);
+        assert_eq!(l.debts().received_at, vec![Some(t(DAY + 4))]);
+    }
+
+    #[test]
+    fn app_24_totals_owed_sent_confirmed() {
+        let w = [A, B];
+        let mut l = Ledger::new();
+        let tasks = || {
+            snap(vec![
+                obs(1, Some(DAY)),
+                obs(2, Some(DAY)),
+                obs(3, Some(3 * DAY)),
+            ])
+        };
+        poll(&mut l, &tasks(), 0, &w);
+        set_amount(&mut l, 2500, 2 * DAY, &w);
+        poll(&mut l, &tasks(), 4 * DAY, &w);
+        assert_eq!(
+            l.debts().amount,
+            vec![Centimes(1000), Centimes(1000), Centimes(2500)]
+        );
+        assert_eq!(
+            l.totals(),
+            Totals {
+                owed: Centimes(4500),
+                ..Totals::default()
+            }
+        );
+        // Debt 0 stays unclaimed; debt 1 is sent; debt 2 is received.
+        claimed(&mut l, 1, A, &w, 5 * DAY);
+        claimed(&mut l, 2, B, &w, 5 * DAY);
+        l.apply(&l.mark_sent(DebtId(1), t(6 * DAY)).unwrap());
+        l.apply(&l.mark_sent(DebtId(2), t(6 * DAY)).unwrap());
+        l.apply(&l.mark_received(DebtId(2), B, t(7 * DAY)).unwrap());
+        assert_eq!(
+            l.totals(),
+            Totals {
+                owed: Centimes(4500),
+                sent: Centimes(3500),
+                confirmed: Centimes(2500)
+            }
+        );
+    }
+
+    #[test]
+    fn ledger_double_claim_same_witness_is_rejected_not_duplicated() {
+        let w = [A, B];
+        let (mut l, _) = one_late_debt(&w);
+        claimed(&mut l, 0, A, &w, DAY + 2);
+        assert_eq!(
+            l.claim(DebtId(0), A, &w, t(DAY + 3)),
+            Err(RuleError::AlreadyClaimed)
+        );
+        assert_eq!(l.debts().owner, vec![Some(A)]);
+        // Auto-claimed debts reject a manual claim by the same witness too.
+        let (l, _) = one_late_debt(&[A]);
+        assert_eq!(
+            l.claim(DebtId(0), A, &[A], t(DAY + 2)),
+            Err(RuleError::AlreadyClaimed)
+        );
+    }
 
     // DB-3, Review Focus 4
-    #[test] fn db_3_replaying_changes_rebuilds_same_state() { todo!() }
+    #[test]
+    fn db_3_replaying_changes_rebuilds_same_state() {
+        let wit = [A, B];
+        let mut live = Ledger::new();
+        let mut log: Vec<Change> = Vec::new();
+        let mut run = |live: &mut Ledger, c: Vec<Change>| {
+            apply_all(live, &c);
+            log.extend(c);
+        };
+        let step = live.observe(
+            &snap(vec![
+                obs(1, Some(DAY)),
+                daily(2, DAY, None),
+                obs(3, Some(2 * DAY)),
+            ]),
+            t(0),
+            &wit,
+        );
+        run(&mut live, step);
+        let step = live.observe(
+            &snap(vec![
+                done(obs(1, Some(DAY)), 10),
+                daily(2, DAY, None),
+                obs(3, Some(DAY / 2)),
+            ]),
+            t(20),
+            &wit,
+        );
+        run(&mut live, step);
+        let step = vec![live.propose_amount(Centimes(1800), t(30)).unwrap()];
+        run(&mut live, step);
+        let step = live.approve_amount(A, &wit, t(40)).unwrap();
+        run(&mut live, step);
+        let step = live.observe(
+            &snap(vec![daily(2, 2 * DAY, Some(DAY + HOUR))]),
+            t(DAY + 2 * HOUR),
+            &wit,
+        );
+        run(&mut live, step);
+        let step = vec![live.claim(DebtId(0), B, &wit, t(DAY + 3 * HOUR)).unwrap()];
+        run(&mut live, step);
+        let step = vec![live.mark_sent(DebtId(0), t(DAY + 4 * HOUR)).unwrap()];
+        run(&mut live, step);
+        let step = vec![live.mark_received(DebtId(0), B, t(DAY + 5 * HOUR)).unwrap()];
+        run(&mut live, step);
+        assert!(log.iter().any(|c| matches!(c, Change::DebtCreated { .. })));
+        assert!(log.iter().any(|c| matches!(c, Change::Event { .. })));
+        assert!(log.iter().any(|c| matches!(c, Change::SeenDone { .. })));
+
+        let mut rebuilt = Ledger::new();
+        apply_all(&mut rebuilt, &log);
+        assert_eq!(format!("{rebuilt:?}"), format!("{live:?}"));
+        assert_eq!(rebuilt.occurrences(), live.occurrences());
+        assert_eq!(rebuilt.events(), live.events());
+        assert_eq!(rebuilt.debts(), live.debts());
+        assert_eq!(rebuilt.totals(), live.totals());
+        assert_eq!(rebuilt.amount(), live.amount());
+        assert_eq!(rebuilt.proposal(), live.proposal());
+        // After the restart both decide the next poll the same way, so
+        // deadlines that passed while down are still decided (DB-3).
+        let next = snap(vec![daily(2, 2 * DAY, Some(DAY + HOUR))]);
+        assert_eq!(
+            rebuilt.observe(&next, t(3 * DAY), &wit),
+            live.observe(&next, t(3 * DAY), &wit)
+        );
+        assert!(!rebuilt.observe(&next, t(3 * DAY), &wit).is_empty());
+    }
 }
