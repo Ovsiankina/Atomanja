@@ -2,7 +2,7 @@
 //! maud. The markup and class names follow `design-system/components/
 //! bundle.js` (the React reference) so `bundle.css` styles them as is.
 
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, DOCTYPE};
 
 use super::i18n::Msgs;
 use crate::ledger::Totals;
@@ -280,10 +280,4 @@ pub(super) fn notice_card(label: &str, title: &str, text: &str, link: (&str, &st
             a.page__link href=(link.0) { (link.1) }
         }
     }
-}
-
-/// Literal pre-escaped markup (static SVG glyphs etc.).
-#[allow(dead_code)]
-pub(super) fn raw(s: &'static str) -> PreEscaped<&'static str> {
-    PreEscaped(s)
 }

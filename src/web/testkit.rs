@@ -3,6 +3,7 @@
 //! hand (no `cookies` / `form` features on reqwest, no tower dev-dep).
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use time::OffsetDateTime;
@@ -130,6 +131,15 @@ impl Harness {
             .await
     }
 
+    /// `GET path` from a browser that prefers English.
+    pub async fn get_english_browser(&self, path: &str) -> Reply {
+        let req = self
+            .client
+            .get(format!("{}{path}", self.base))
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
+        self.send(req, None).await
+    }
+
     /// `POST path` as a plain HTML form.
     pub async fn post(&self, path: &str, cookie: Option<&str>, fields: &[(&str, &str)]) -> Reply {
         self.send(form(self.client.post(format!("{}{path}", self.base)), fields), cookie)
@@ -198,7 +208,9 @@ fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(char::from(b));
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out

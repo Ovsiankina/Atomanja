@@ -1,17 +1,19 @@
 //! The settings screen: accounts and invite link (APP-26), amount
 //! proposal (APP-16), language (APP-39), notifications (APP-33).
 
-use axum::extract::State;
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::extract::{Form, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use maud::{html, Markup};
+use serde::Deserialize;
 
 use super::handlers::{page, require};
 use super::i18n::{msgs, Msgs};
 use super::pages::{self, Field, Variant};
-use super::session::{internal, lock};
+use super::session::{internal, lock, see_other};
 use super::{pwa, AppState};
 use crate::auth::{self, Account, Action, Database, Role};
+use crate::config::Lang;
 use crate::ledger::{Ledger, WitnessId};
 use crate::store::{Kind, Store, StoreError};
 
@@ -26,7 +28,7 @@ pub(super) struct InviteOutcome {
 pub(super) async fn settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let actor = match require(&state, &headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     render(&state, &actor.account, None, None)
 }
@@ -49,6 +51,7 @@ pub(super) fn render(
         Ok(b) => {
             let full = html! {
                 (b)
+                (pages::section(3, m.language, &language_switch(m)))
                 (pages::section(4, m.notif_label, &install_steps(m, push_key.as_deref())))
             };
             page(m, m.nav_settings, "settings", &full)
@@ -76,6 +79,52 @@ fn body<K: Kind>(
             (pages::section(2, m.accounts, &account_panel(m, &accounts, account, invite)))
         }
     })
+}
+
+/// One button that switches the account to the other language (APP-39).
+/// Its label is in the language it switches to.
+fn language_switch(m: &Msgs) -> Markup {
+    let other = match m.lang {
+        Lang::Fr => Lang::En,
+        Lang::En => Lang::Fr,
+    };
+    html! {
+        form.page__row method="post" action="/lang" {
+            input type="hidden" name="lang" value=(other.code());
+            (pages::button(m.other_lang_name, Variant::Outline, false, false, None))
+        }
+    }
+}
+
+/// The language form field.
+#[derive(Deserialize)]
+pub(super) struct LangForm {
+    #[serde(default)]
+    lang: String,
+}
+
+/// `POST /lang`: store the account's language, in the file that holds
+/// the account (APP-39, DEV-3).
+pub(super) async fn set_lang(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<LangForm>,
+) -> Response {
+    let actor = match require(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let Some(lang) = Lang::from_code(&f.lang) else {
+        return (StatusCode::BAD_REQUEST, msgs(actor.account.lang).err_state).into_response();
+    };
+    let done = match actor.home {
+        Database::Ledger => lock(&state.ledger).set_lang(actor.account.id, lang),
+        Database::Dev => lock(&state.dev).set_lang(actor.account.id, lang),
+    };
+    match done {
+        Ok(()) => see_other("/settings"),
+        Err(e) => internal(&e),
+    }
 }
 
 /// The `InstallSteps`: Home Screen steps for iPhone, then the button

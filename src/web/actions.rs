@@ -150,10 +150,10 @@ fn debt_change(
 }
 
 /// Shared body of the three debt routes.
-async fn debt_action(state: AppState, headers: HeaderMap, debt: u32, op: DebtOp) -> Response {
-    let actor = match require(&state, &headers) {
+fn debt_action(state: &AppState, headers: &HeaderMap, debt: u32, op: DebtOp) -> Response {
+    let actor = match require(state, headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let m = msgs(actor.account.lang);
     let action = match op {
@@ -177,7 +177,7 @@ async fn debt_action(state: AppState, headers: HeaderMap, debt: u32, op: DebtOp)
     };
     let error = match result {
         Ok(pushes) => {
-            spawn_pushes(&state, pushes);
+            spawn_pushes(state, pushes);
             None
         }
         Err(RuleError::UnknownDebt) => {
@@ -196,7 +196,7 @@ async fn debt_action(state: AppState, headers: HeaderMap, debt: u32, op: DebtOp)
     } else {
         StatusCode::OK
     };
-    if is_htmx(&headers) {
+    if is_htmx(headers) {
         return (status, views::debt_fragment(&ctx, &ledger, debt, error)).into_response();
     }
     match error {
@@ -215,7 +215,7 @@ pub(super) async fn claim(
     Path(debt): Path<u32>,
     headers: HeaderMap,
 ) -> Response {
-    debt_action(state, headers, debt, DebtOp::Claim).await
+    debt_action(&state, &headers, debt, DebtOp::Claim)
 }
 
 /// `POST /debts/{id}/sent` (APP-21, APP-23).
@@ -224,7 +224,7 @@ pub(super) async fn sent(
     Path(debt): Path<u32>,
     headers: HeaderMap,
 ) -> Response {
-    debt_action(state, headers, debt, DebtOp::Sent).await
+    debt_action(&state, &headers, debt, DebtOp::Sent)
 }
 
 /// `POST /debts/{id}/received` (APP-22, APP-23).
@@ -233,7 +233,7 @@ pub(super) async fn received(
     Path(debt): Path<u32>,
     headers: HeaderMap,
 ) -> Response {
-    debt_action(state, headers, debt, DebtOp::Received).await
+    debt_action(&state, &headers, debt, DebtOp::Received)
 }
 
 /// The proposal form field: whole CHF.
@@ -288,10 +288,10 @@ fn amount_change(
 }
 
 /// Shared body of the two amount routes (APP-16).
-async fn amount_action(state: AppState, headers: HeaderMap, op: AmountOp) -> Response {
-    let actor = match require(&state, &headers) {
+fn amount_action(state: &AppState, headers: &HeaderMap, op: AmountOp) -> Response {
+    let actor = match require(state, headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let m = msgs(actor.account.lang);
     let action = match op {
@@ -317,14 +317,14 @@ async fn amount_action(state: AppState, headers: HeaderMap, op: AmountOp) -> Res
     } else {
         StatusCode::OK
     };
-    if is_htmx(&headers) {
+    if is_htmx(headers) {
         let block = settings::amount_block(m, &ledger, &accounts, &actor.account, error);
         return (status, block).into_response();
     }
     match error {
         None => see_other("/settings"),
         Some(e) => {
-            let mut r = settings::render(&state, &actor.account, None, Some(e));
+            let mut r = settings::render(state, &actor.account, None, Some(e));
             *r.status_mut() = status;
             r
         }
@@ -337,11 +337,11 @@ pub(super) async fn propose(
     headers: HeaderMap,
     Form(f): Form<AmountForm>,
 ) -> Response {
-    amount_action(state, headers, AmountOp::Propose(parse_chf(&f.amount))).await
+    amount_action(&state, &headers, AmountOp::Propose(parse_chf(&f.amount)))
 }
 
 /// `POST /amount/approve`: a real witness agrees; the amount comes into
 /// force when every real witness has (APP-16).
 pub(super) async fn approve(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    amount_action(state, headers, AmountOp::Approve).await
+    amount_action(&state, &headers, AmountOp::Approve)
 }

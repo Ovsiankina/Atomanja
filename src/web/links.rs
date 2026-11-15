@@ -80,7 +80,7 @@ pub(super) async fn create_invite(
 ) -> Response {
     let actor = match require(&state, &headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let m = msgs(actor.account.lang);
     if !auth::permits(&actor.account, auth::Action::CreateInvite) {

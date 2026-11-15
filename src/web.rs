@@ -94,6 +94,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/login", get(handlers::login_form).post(handlers::login))
         .route("/logout", post(handlers::logout))
         .route("/settings", get(settings::settings))
+        .route("/lang", post(settings::set_lang))
         .route("/invite", post(links::create_invite))
         .route("/invite/{token}", get(links::accept_form).post(links::accept))
         .route("/reset", get(links::reset_request_form).post(links::reset_request))
@@ -107,6 +108,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/manifest.webmanifest", get(pwa::manifest))
         .route("/sw.js", get(pwa::service_worker))
         .route("/push/subscribe", post(pwa::subscribe))
+        .fallback(handlers::not_found)
         .with_state(state)
 }
 
@@ -819,7 +821,86 @@ mod tests {
     }
 
     // web-08
-    #[test] fn app_38_pages_default_to_french() { todo!() }
-    #[test] fn app_39_account_language_switch_to_english_and_back() { todo!() }
-    #[test] fn app_40_pre_login_pages_in_french() { todo!() }
+    #[tokio::test]
+    async fn app_38_pages_default_to_french() {
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let (cw, ca) = h.ledger(|s| (testkit::session(s, &p.worker), testkit::session(s, &p.a)));
+        for (cookie, path) in [(&cw, "/"), (&cw, "/settings"), (&ca, "/"), (&ca, "/settings")] {
+            let page = h.get(path, Some(cookie)).await.body;
+            assert!(page.contains(r#"<html lang="fr""#), "{path}");
+            assert!(page.contains("Se déconnecter"), "{path}");
+            assert!(!page.contains("Sign out"), "{path}");
+        }
+        let view = h.get("/", Some(&cw)).await.body;
+        assert!(view.contains("Dû") && view.contains("Marquer envoyé") && view.contains("En retard"));
+        assert!(!view.contains("Owed") && !view.contains("Mark sent"));
+        let hx = h.hx_post("/debts/2/claim", Some(&ca), &[]).await.body;
+        assert!(hx.contains("Réclamée par vous"), "fragments too: {hx}");
+    }
+
+    #[tokio::test]
+    async fn app_39_account_language_switch_to_english_and_back() {
+        use crate::config::Lang;
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let cw = h.ledger(|s| testkit::session(s, &p.worker));
+        let settings = h.get("/settings", Some(&cw)).await.body;
+        assert!(settings.contains(r#"action="/lang""#), "settings offer the switch");
+        assert!(settings.contains("English"));
+
+        let en = h.post("/lang", Some(&cw), &[("lang", "en")]).await;
+        assert_eq!(en.status, 303);
+        assert_eq!(en.location(), Some("/settings"));
+        assert_eq!(h.ledger(|s| s.account(p.worker.id).unwrap()).unwrap().lang, Lang::En);
+        let view = h.get("/", Some(&cw)).await.body;
+        assert!(view.contains(r#"<html lang="en""#));
+        for word in ["Sign out", "Owed", "Mark sent", "Late", "Claimed by a@witness.test", "14 Nov"] {
+            assert!(view.contains(word), "English view has {word}");
+        }
+        assert!(!view.contains("Se déconnecter"));
+        let back_label = h.get("/settings", Some(&cw)).await.body;
+        assert!(back_label.contains("Français"));
+        // Other accounts keep their own language.
+        let ca = h.ledger(|s| testkit::session(s, &p.a));
+        assert!(h.get("/", Some(&ca)).await.body.contains(r#"<html lang="fr""#));
+
+        assert_eq!(h.post("/lang", Some(&cw), &[("lang", "de")]).await.status, 400);
+        let fr = h.post("/lang", Some(&cw), &[("lang", "fr")]).await;
+        assert_eq!(fr.status, 303);
+        assert_eq!(h.ledger(|s| s.account(p.worker.id).unwrap()).unwrap().lang, Lang::Fr);
+        assert!(h.get("/", Some(&cw)).await.body.contains("Se déconnecter"));
+        assert_eq!(h.post("/lang", None, &[("lang", "en")]).await.status, 303, "anonymous: to login");
+    }
+
+    #[tokio::test]
+    async fn app_40_pre_login_pages_in_french() {
+        use crate::config::Lang;
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| testkit::account(s, "worker@atomanja.test", Role::Worker));
+        h.ledger(|s| s.set_lang(worker.id, Lang::En).unwrap());
+        let (invite, reset) = h.ledger(|s| {
+            (
+                testkit::token(s, TokenKind::Invite, None, time::Duration::minutes(1), false),
+                testkit::token(s, TokenKind::Reset, Some(&worker), time::Duration::minutes(1), false),
+            )
+        });
+        let pages = [
+            ("/login".to_owned(), "Se connecter"),
+            ("/reset".to_owned(), "Envoyer le lien"),
+            (format!("/invite/{invite}"), "Accepter l'invitation"),
+            (format!("/reset/{reset}"), "Choisir ce mot de passe"),
+            ("/invite/unknown".to_owned(), "Ce lien n'est pas valide."),
+        ];
+        for (path, french) in pages {
+            let r = h.get_english_browser(&path).await;
+            assert!(r.body.contains(r#"<html lang="fr""#), "{path}");
+            assert!(r.body.contains(french), "{path}: {}", r.body);
+            for english in ["Sign in", "Password", "Accept invite", "Send the link"] {
+                assert!(!r.body.contains(english), "{path} has {english}");
+            }
+        }
+        let failed = h.post("/login", None, &[("email", "worker@atomanja.test"), ("password", "nope nope")]).await;
+        assert!(failed.body.contains(r#"<html lang="fr""#), "even for an English account");
+    }
 }

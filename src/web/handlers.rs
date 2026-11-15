@@ -19,12 +19,12 @@ use crate::ledger::TaskId;
 use crate::store::{Kind, Store, StoreError};
 
 /// The signed-in actor, or the response to send instead (redirect to
-/// the login page, or 500).
-pub(super) fn require(state: &AppState, headers: &HeaderMap) -> Result<Actor, Response> {
+/// the login page, or 500). Boxed: a `Response` is large.
+pub(super) fn require(state: &AppState, headers: &HeaderMap) -> Result<Actor, Box<Response>> {
     match session::actor(state, headers) {
         Ok(Some(a)) => Ok(a),
-        Ok(None) => Err(see_other("/login")),
-        Err(e) => Err(internal(&e)),
+        Ok(None) => Err(Box::new(see_other("/login"))),
+        Err(e) => Err(Box::new(internal(&e))),
     }
 }
 
@@ -38,12 +38,19 @@ pub(super) fn public_page(title: &str, content: &Markup) -> Markup {
     pages::layout(msgs(Lang::Fr), title, None, content)
 }
 
+/// Any other path: 404 with a page that leads back.
+pub(super) async fn not_found() -> Response {
+    let m = msgs(Lang::Fr);
+    let card = pages::notice_card("404", m.err_not_found, m.err_not_found, ("/", m.nav_tasks));
+    (StatusCode::NOT_FOUND, public_page(m.err_not_found, &card)).into_response()
+}
+
 /// `GET /`: the worker view or the witness view, from the one file the
 /// account's role reads (DEV-3).
 pub(super) async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let actor = match require(&state, &headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let m = msgs(actor.account.lang);
     // Titles are copied before any store lock (never two locks at once),
