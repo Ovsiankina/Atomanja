@@ -10,7 +10,7 @@ use super::handlers::{page, require};
 use super::i18n::{msgs, Msgs};
 use super::pages::{self, Field, Variant};
 use super::session::{internal, lock};
-use super::AppState;
+use super::{pwa, AppState};
 use crate::auth::{self, Account, Action, Database, Role};
 use crate::ledger::{Ledger, WitnessId};
 use crate::store::{Kind, Store, StoreError};
@@ -40,12 +40,19 @@ pub(super) fn render(
     amount_error: Option<&str>,
 ) -> Response {
     let m = msgs(account.lang);
+    let push_key = pwa::public_key(state);
     let body = match account.role.database() {
         Database::Ledger => body(&*lock(&state.ledger), account, invite, amount_error),
         Database::Dev => body(&*lock(&state.dev), account, invite, amount_error),
     };
     match body {
-        Ok(b) => page(m, m.nav_settings, "settings", &b),
+        Ok(b) => {
+            let full = html! {
+                (b)
+                (pages::section(4, m.notif_label, &install_steps(m, push_key.as_deref())))
+            };
+            page(m, m.nav_settings, "settings", &full)
+        }
         Err(e) => internal(&e),
     }
 }
@@ -69,6 +76,25 @@ fn body<K: Kind>(
             (pages::section(2, m.accounts, &account_panel(m, &accounts, account, invite)))
         }
     })
+}
+
+/// The `InstallSteps`: Home Screen steps for iPhone, then the button
+/// `app.js` enables once push can work (APP-33).
+fn install_steps(m: &Msgs, push_key: Option<&str>) -> Markup {
+    html! {
+        div.at-install {
+            ol.at-steps {
+                @for (i, step) in m.notif_steps.iter().enumerate() {
+                    li.at-step { span.at-index { "/0." (i + 1) } span { (step) } }
+                }
+            }
+            button.at-btn.at-btn--solid.at-btn--block type="button" id="enable-push" disabled
+                data-key=(push_key.unwrap_or("")) data-done=(m.notif_enabled) {
+                span { (m.notif_enable) }
+            }
+            p.at-muted id="push-hint" { (m.notif_unlock) }
+        }
+    }
 }
 
 /// The `AmountProposal`: the amount in force, the open proposal with one

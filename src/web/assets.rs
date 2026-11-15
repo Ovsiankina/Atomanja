@@ -13,6 +13,7 @@ const FILES: &[(&str, &str, &str)] = &[
     ("bundle.css", "text/css; charset=utf-8", include_str!("../../assets/bundle.css")),
     ("app.css", "text/css; charset=utf-8", include_str!("../../assets/app.css")),
     ("htmx.min.js", "text/javascript; charset=utf-8", include_str!("../../assets/htmx.min.js")),
+    ("app.js", "text/javascript; charset=utf-8", include_str!("../../assets/app.js")),
     ("icon.svg", "image/svg+xml", include_str!("../../assets/icon.svg")),
 ];
 

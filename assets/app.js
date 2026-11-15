@@ -1,0 +1,57 @@
+/* Atomanja client script: registers the service worker and wires the
+   "Enable notifications" button of the settings page (APP-33). Pages work
+   without it; htmx is optional too. */
+(function () {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js');
+  }
+
+  var btn = document.getElementById('enable-push');
+  if (!btn) return;
+  var hint = document.getElementById('push-hint');
+  var key = btn.getAttribute('data-key');
+
+  function bytes(b64) {
+    var s = (b64 + '===='.slice((b64.length + 3) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+    var raw = atob(s), out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  function done() {
+    btn.disabled = true;
+    btn.firstChild.textContent = btn.getAttribute('data-done');
+    if (hint) hint.hidden = true;
+  }
+
+  // The button stays disabled until push can work: iPhone only allows it
+  // from the Home Screen app; other browsers allow it in a tab.
+  var standalone = navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  var ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  if (!key || !('serviceWorker' in navigator) || !('PushManager' in window) || (ios && !standalone)) return;
+
+  navigator.serviceWorker.ready.then(function (reg) {
+    return reg.pushManager.getSubscription();
+  }).then(function (sub) {
+    if (sub && Notification.permission === 'granted') { done(); return; }
+    btn.disabled = false;
+    if (hint) hint.hidden = true;
+  });
+
+  btn.addEventListener('click', function () {
+    Notification.requestPermission().then(function (perm) {
+      if (perm !== 'granted') return null;
+      return navigator.serviceWorker.ready.then(function (reg) {
+        return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(key) });
+      }).then(function (sub) {
+        return fetch('/push/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify(sub)
+        });
+      }).then(function (res) { if (res && res.ok) done(); });
+    });
+  });
+})();

@@ -55,6 +55,7 @@ mod i18n;
 mod links;
 mod outbox;
 mod pages;
+mod pwa;
 mod session;
 mod settings;
 mod views;
@@ -103,6 +104,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/amount/propose", post(actions::propose))
         .route("/amount/approve", post(actions::approve))
         .route("/assets/{name}", get(assets::asset))
+        .route("/manifest.webmanifest", get(pwa::manifest))
+        .route("/sw.js", get(pwa::service_worker))
+        .route("/push/subscribe", post(pwa::subscribe))
         .with_state(state)
 }
 
@@ -741,9 +745,78 @@ mod tests {
     }
 
     // web-07
-    #[test] fn app_33_manifest_served() { todo!() }
-    #[test] fn app_33_service_worker_served() { todo!() }
-    #[test] fn app_33_push_subscribe_stores_device() { todo!() }
+    #[tokio::test]
+    async fn app_33_manifest_served() {
+        let h = Harness::start().await;
+        let login = h.get("/login", None).await;
+        assert!(login.body.contains(r#"rel="manifest" href="/manifest.webmanifest""#));
+        let r = h.get("/manifest.webmanifest", None).await;
+        assert_eq!(r.status, 200);
+        let mime = r.headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(mime.starts_with("application/manifest+json"), "{mime}");
+        let json: serde_json::Value = serde_json::from_str(&r.body).expect("valid JSON");
+        assert_eq!(json["name"], "Atomanja");
+        assert_eq!(json["start_url"], "/");
+        assert_eq!(json["display"], "standalone");
+        let icon = json["icons"][0]["src"].as_str().expect("an icon");
+        assert_eq!(h.get(icon, None).await.status, 200, "icon {icon} served");
+    }
+
+    #[tokio::test]
+    async fn app_33_service_worker_served() {
+        let h = Harness::start().await;
+        let r = h.get("/sw.js", None).await;
+        assert_eq!(r.status, 200);
+        let mime = r.headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(mime.starts_with("text/javascript"), "{mime}");
+        for needle in ["addEventListener('push'", "showNotification", "notificationclick"] {
+            assert!(r.body.contains(needle), "sw handles {needle}");
+        }
+        let app = h.get("/assets/app.js", None).await;
+        assert_eq!(app.status, 200);
+        assert!(app.body.contains("serviceWorker.register('/sw.js')"), "pages register it");
+        assert!(app.body.contains("/push/subscribe"));
+        let htmx = h.get("/assets/htmx.min.js", None).await;
+        assert_eq!(htmx.status, 200, "htmx is vendored, never a CDN");
+        assert!(htmx.body.contains("htmx"));
+    }
+
+    #[tokio::test]
+    async fn app_33_push_subscribe_stores_device() {
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| testkit::account(s, "worker@atomanja.test", Role::Worker));
+        let cookie = h.ledger(|s| testkit::session(s, &worker));
+        let device = |n: u32, auth: &str| {
+            format!(
+                r#"{{"endpoint":"https://push.example/send/{n}","expirationTime":null,"keys":{{"p256dh":"BNcR-key-{n}","auth":"{auth}"}}}}"#
+            )
+        };
+
+        let settings = h.get("/settings", Some(&cookie)).await.body;
+        assert!(settings.contains(r#"id="enable-push""#), "settings offer notifications");
+
+        assert_eq!(h.post_json("/push/subscribe", None, &device(1, "a")).await.status, 401);
+        assert_eq!(h.post_json("/push/subscribe", Some(&cookie), &device(1, "a")).await.status, 204);
+        assert_eq!(h.post_json("/push/subscribe", Some(&cookie), &device(2, "b")).await.status, 204);
+        // The same device again replaces its keys; it is not a third one.
+        assert_eq!(h.post_json("/push/subscribe", Some(&cookie), &device(2, "c")).await.status, 204);
+        let subs = h.ledger(|s| s.subscriptions(worker.id).unwrap());
+        assert_eq!(subs.len(), 2, "any number of devices per user");
+        assert_eq!(subs[1].auth, "c");
+        let bad = h
+            .post_json("/push/subscribe", Some(&cookie), r#"{"endpoint":"http://x","keys":{"p256dh":"","auth":""}}"#)
+            .await;
+        assert_eq!(bad.status, 400);
+
+        // The admin's devices live in the dev file (DEV-3).
+        let admin = h.dev(|s| testkit::account(s, "admin@atomanja.test", Role::Admin));
+        let ac = h.dev(|s| testkit::session(s, &admin));
+        assert_eq!(h.post_json("/push/subscribe", Some(&ac), &device(9, "z")).await.status, 204);
+        assert_eq!(h.dev(|s| s.subscriptions(admin.id).unwrap()).len(), 1);
+        // Ids are per file (the admin may share the worker's id): check by endpoint.
+        let ledger_subs = h.ledger(|s| s.subscriptions(admin.id).unwrap());
+        assert!(ledger_subs.iter().all(|s| !s.endpoint.ends_with("/send/9")));
+    }
 
     // web-08
     #[test] fn app_38_pages_default_to_french() { todo!() }

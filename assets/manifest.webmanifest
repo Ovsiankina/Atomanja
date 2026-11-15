@@ -1,0 +1,13 @@
+{
+  "name": "Atomanja",
+  "short_name": "Atomanja",
+  "description": "Missed Vikunja deadlines become debts owed to a witness.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1f1f1f",
+  "theme_color": "#1f1f1f",
+  "icons": [
+    { "src": "/assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
