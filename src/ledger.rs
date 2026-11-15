@@ -327,19 +327,76 @@ pub struct Ledger {
     occurrences: OccurrenceTable,
     events: EventTable,
     debts: DebtTable,
+    // DECISION: bookkeeping the views do not need lives in private
+    // columns beside the pub tables, same length as `occurrences`, so the
+    // pub contract stays as frozen and `apply` still rebuilds all of it.
+    tracking: Tracking,
+    // DECISION: a BTreeMap, not a HashMap, so two ledgers built from the
+    // same changes have the same Debug output (db_3 compares it).
+    current: std::collections::BTreeMap<TaskId, OccurrenceId>,
+}
+
+/// Private per-occurrence columns, indexed by [`OccurrenceId`].
+#[derive(Clone, Debug, Default)]
+struct Tracking {
+    /// `Recorded.at`: the moment the occurrence was first seen (APP-8).
+    recorded_at: Vec<Timestamp>,
+    /// Last done flag seen by a poll before the deadline (APP-9).
+    seen_done: Vec<bool>,
+    /// Last due-date state seen, to log each change once (APP-6, APP-7).
+    last_seen: Vec<Seen>,
+}
+
+/// What the last poll showed of an occurrence's task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seen {
+    /// Tracked, with this due date.
+    Due(Timestamp),
+    /// Visible, but its due date was removed.
+    NoDue,
+    /// Not visible as a tracked task any more.
+    Gone,
+}
+
+/// Row id for the next row of a column of length `len`.
+fn next_id(len: usize) -> u32 {
+    // DECISION: u32 rows are a frozen contract choice; four billion
+    // occurrences or debts is out of reach for one worker, so overflow
+    // is a bug worth a panic rather than a silent wrap.
+    u32::try_from(len).expect("ledger table exceeds u32 rows")
+}
+
+fn idx(id: u32) -> usize {
+    id as usize
+}
+
+/// The due date of a tracked task (APP-3), `None` when not tracked.
+fn tracked_due(o: &Observation) -> Option<Timestamp> {
+    if o.archived { None } else { o.due }
 }
 
 impl Ledger {
     /// An empty ledger, amount 10 CHF (APP-15).
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     /// Mutate the state by one change. The only mutator; used after a
     /// change is persisted and when loading from disk (DB-3).
     pub fn apply(&mut self, change: &Change) {
-        let _ = change;
-        todo!()
+        match *change {
+            Change::Recorded { occurrence, task, deadline, at } => {
+                debug_assert_eq!(idx(occurrence.0), self.occurrences.task.len());
+                self.occurrences.deadline.push(deadline);
+                self.occurrences.task.push(task);
+                self.occurrences.outcome.push(Outcome::Pending);
+                self.tracking.recorded_at.push(at);
+                self.tracking.seen_done.push(false);
+                self.tracking.last_seen.push(Seen::Due(deadline));
+                self.current.insert(task, occurrence);
+            }
+            _ => todo!(),
+        }
     }
 
     /// Compare one complete snapshot with the state at `now` and return
@@ -354,8 +411,26 @@ impl Ledger {
         now: Timestamp,
         real_witnesses: &[WitnessId],
     ) -> Vec<Change> {
-        let _ = (snapshot, now, real_witnesses);
-        todo!()
+        let _ = real_witnesses;
+        let mut out = Vec::new();
+        let mut next_occ = next_id(self.occurrences.task.len());
+        for o in &snapshot.tasks {
+            if self.current.contains_key(&o.task) {
+                continue;
+            }
+            if let Some(due) = tracked_due(o) {
+                if due > now {
+                    out.push(Change::Recorded {
+                        occurrence: OccurrenceId(next_occ),
+                        task: o.task,
+                        deadline: due,
+                        at: now,
+                    });
+                    next_occ += 1;
+                }
+            }
+        }
+        out
     }
 
     /// A real witness claims an unclaimed debt (APP-18, APP-19, APP-20).
@@ -476,10 +551,91 @@ mod tests {
         assert_eq!(size_of::<Observation>(), 48);
     }
 
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
+
+    fn t(secs: i64) -> Timestamp {
+        Timestamp(secs)
+    }
+
+    /// A plain, non-recurring, open task.
+    fn obs(task: i64, due: Option<i64>) -> Observation {
+        Observation {
+            due: due.map(Timestamp),
+            done_at: None,
+            task: TaskId(task),
+            repeat_after_secs: 0,
+            repeat_mode: RepeatMode::Interval,
+            done: false,
+            archived: false,
+        }
+    }
+
+    /// A task marked done at `done_at`.
+    fn done(mut o: Observation, done_at: i64) -> Observation {
+        o.done = true;
+        o.done_at = Some(t(done_at));
+        o
+    }
+
+    /// A daily recurring task.
+    fn daily(task: i64, due: i64, done_at: Option<i64>) -> Observation {
+        let mut o = obs(task, Some(due));
+        o.repeat_after_secs = u32::try_from(DAY).unwrap();
+        o.done_at = done_at.map(Timestamp);
+        o
+    }
+
+    fn snap(tasks: Vec<Observation>) -> Snapshot {
+        Snapshot { tasks }
+    }
+
+    /// Observe and apply every change, as `sync` does.
+    fn poll(l: &mut Ledger, s: &Snapshot, now: i64, witnesses: &[WitnessId]) -> Vec<Change> {
+        let changes = l.observe(s, t(now), witnesses);
+        for c in &changes {
+            l.apply(c);
+        }
+        changes
+    }
+
+    fn apply_all(l: &mut Ledger, changes: &[Change]) {
+        for c in changes {
+            l.apply(c);
+        }
+    }
+
     // ledger-01
-    #[test] fn nfr_2_tables_are_columnar() { todo!() }
-    #[test] fn app_3_task_without_due_date_not_tracked() { todo!() }
-    #[test] fn app_3_archived_project_not_tracked() { todo!() }
+    #[test]
+    fn nfr_2_tables_are_columnar() {
+        let mut l = Ledger::new();
+        let n = 5;
+        let tasks = (0..n).map(|i| obs(i, Some(DAY + i))).collect();
+        poll(&mut l, &snap(tasks), 0, &[]);
+        let o = l.occurrences();
+        assert_eq!(o.deadline.len(), 5);
+        assert_eq!(o.task.len(), 5);
+        assert_eq!(o.outcome.len(), 5);
+        assert_eq!(o.task[3], TaskId(3));
+        assert_eq!(o.deadline[3], t(DAY + 3));
+        assert!(o.outcome.iter().all(|&x| x == Outcome::Pending));
+    }
+
+    #[test]
+    fn app_3_task_without_due_date_not_tracked() {
+        let l = Ledger::new();
+        let changes = l.observe(&snap(vec![obs(1, None)]), t(0), &[]);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn app_3_archived_project_not_tracked() {
+        let l = Ledger::new();
+        let mut o = obs(1, Some(DAY));
+        o.archived = true;
+        let changes = l.observe(&snap(vec![o]), t(0), &[]);
+        assert!(changes.is_empty());
+    }
 
     // ledger-02
     #[test] fn app_4_records_future_deadline() { todo!() }
