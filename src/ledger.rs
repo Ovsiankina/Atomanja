@@ -348,8 +348,12 @@ pub struct Ledger {
 struct Tracking {
     /// `Recorded.at`: the moment the occurrence was first seen (APP-8).
     recorded_at: Vec<Timestamp>,
-    /// Last done flag seen by a poll before the deadline (APP-9).
-    seen_done: Vec<bool>,
+    /// Every done-flag change seen by a poll before the deadline, as
+    /// `(SeenDone.at, done)` in poll order (APP-9).
+    // DECISION: the whole history, not just the last flag, because a
+    // MovedEarlier event can pull the deadline before some of these polls;
+    // APP-9 then needs the last flag seen at or before the new deadline.
+    seen_done: Vec<Vec<(Timestamp, bool)>>,
     /// Last due-date state seen, to log each change once (APP-6, APP-7).
     last_seen: Vec<Seen>,
 }
@@ -472,7 +476,7 @@ impl Ledger {
                 self.occurrences.task.push(task);
                 self.occurrences.outcome.push(Outcome::Pending);
                 self.tracking.recorded_at.push(at);
-                self.tracking.seen_done.push(false);
+                self.tracking.seen_done.push(Vec::new());
                 self.tracking.last_seen.push(Seen::Due(deadline));
                 self.current.insert(task, occurrence);
             }
@@ -502,9 +506,11 @@ impl Ledger {
                 }
             }
             Change::SeenDone {
-                occurrence, done, ..
+                occurrence,
+                done,
+                at,
             } => {
-                self.tracking.seen_done[idx(occurrence.0)] = done;
+                self.tracking.seen_done[idx(occurrence.0)].push((at, done));
             }
             Change::Decided {
                 occurrence,
@@ -611,6 +617,23 @@ impl Ledger {
             .map_or(Centimes::DEFAULT_AMOUNT, |&(_, a)| a)
     }
 
+    /// The done flag of the last poll at or before `deadline` (APP-9).
+    /// `false` when no poll up to then saw it done.
+    fn seen_done_by(&self, i: usize, deadline: Timestamp) -> bool {
+        self.tracking.seen_done[i]
+            .iter()
+            .rev()
+            .find(|&&(at, _)| at <= deadline)
+            .is_some_and(|&(_, done)| done)
+    }
+
+    /// The done flag of the most recent poll that saw this occurrence.
+    fn seen_done_last(&self, i: usize) -> bool {
+        self.tracking.seen_done[i]
+            .last()
+            .is_some_and(|&(_, done)| done)
+    }
+
     /// APP-8: recurring, and marked done after the current occurrence
     /// was recorded. The caller has checked that the due date changed.
     fn is_advance(&self, i: usize, o: &Observation) -> bool {
@@ -639,7 +662,8 @@ impl Ledger {
         {
             if self.occurrences.outcome[i] == Outcome::Pending {
                 // The mark-done that advanced it is the done proof.
-                let met = o.done_at.is_some_and(|d| d <= recorded) || self.tracking.seen_done[i];
+                let met =
+                    o.done_at.is_some_and(|d| d <= recorded) || self.seen_done_by(i, recorded);
                 batch.decide(occ, met, self.amount_at(recorded), now);
             }
             // DECISION: a new occurrence whose due date is already past
@@ -653,7 +677,6 @@ impl Ledger {
         }
         let pending = self.occurrences.outcome[i] == Outcome::Pending;
         let mut deadline = recorded;
-        let seen_done = self.tracking.seen_done[i];
         let visible = o.filter(|o| !o.archived);
         if changed {
             let (kind, new_due) = match seen {
@@ -663,6 +686,12 @@ impl Ledger {
                 // recorded deadline, not the previous due date, so the
                 // recorded deadline only ever moves earlier (APP-7), and a
                 // move back towards it is logged as MovedLater.
+                // DECISION: a due date set back to exactly the recorded
+                // deadline (after Removed/Deleted) is also logged as
+                // MovedLater with new_due == recorded. Logging nothing
+                // would leave last_seen stale (only an Event updates it on
+                // replay), so a later removal would go unlogged. A clearer
+                // kind needs a new pub EventKind variant: docs/deferred.md.
                 Seen::Due(d) if d < recorded => (EventKind::MovedEarlier, Some(d)),
                 Seen::Due(d) => (EventKind::MovedLater, Some(d)),
             };
@@ -683,7 +712,7 @@ impl Ledger {
             // DECISION: a task that vanished or was archived shows no done
             // flag, so the last one seen before it went is kept (APP-9).
             if let Some(o) = visible
-                && o.done != seen_done
+                && o.done != self.seen_done_last(i)
             {
                 batch.out.push(Change::SeenDone {
                     occurrence: occ,
@@ -700,7 +729,7 @@ impl Ledger {
             visible.is_some_and(|o| o.done && o.done_at.is_some_and(|d| d <= deadline));
         batch.decide(
             occ,
-            done_in_time || seen_done,
+            done_in_time || self.seen_done_by(i, deadline),
             self.amount_at(deadline),
             now,
         );
@@ -799,7 +828,9 @@ impl Ledger {
 
     /// A real witness approves the pending proposal. Returns
     /// `AmountApproved`, followed by `AmountInForce` when this was the
-    /// last approval needed (APP-16).
+    /// last approval needed (APP-16). A witness who already approved
+    /// gets `AmountInForce` alone when every current real witness has
+    /// approved (the last missing one left the list).
     ///
     /// # Errors
     ///
@@ -815,8 +846,21 @@ impl Ledger {
         }
         let p = self.proposal.as_ref().ok_or(RuleError::NoProposal)?;
         if p.approvals.contains(&witness) {
+            // DECISION: if the last missing witness left after everyone
+            // else approved, a repeat approval from a remaining witness
+            // brings the proposal into force instead of leaving it stuck
+            // (APP-16: "every real witness has approved").
+            if real_witnesses.iter().all(|w| p.approvals.contains(w)) {
+                return Ok(vec![Change::AmountInForce {
+                    amount: p.amount,
+                    at: now,
+                }]);
+            }
             return Err(RuleError::AlreadyApproved);
         }
+        // DECISION: with zero real witnesses nobody can approve, so a
+        // proposal never comes into force; the worker keeps the amount in
+        // force. Accepted: approving needs a real witness by definition.
         let mut out = vec![Change::AmountApproved { witness, at: now }];
         // DECISION: "every real witness" is the list passed now, so a
         // witness who joined after the proposal must approve too, and an
@@ -1049,6 +1093,28 @@ mod tests {
         );
         assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
         assert!(poll(&mut l, &snap(vec![obs(1, None)]), 20, &[]).is_empty());
+    }
+
+    #[test]
+    fn app_6_due_restored_to_recorded_then_removed_again_is_logged() {
+        // Restoring the due date to exactly the recorded deadline must
+        // leave the ledger able to log a later removal (APP-6).
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        poll(&mut l, &snap(vec![obs(1, None)]), 10, &[]);
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 20, &[]);
+        assert!(poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 25, &[]).is_empty());
+        let c = poll(&mut l, &snap(vec![obs(1, None)]), 30, &[]);
+        assert_eq!(
+            c,
+            vec![Change::Event {
+                occurrence: OccurrenceId(0),
+                kind: EventKind::Removed,
+                new_due: None,
+                at: t(30),
+            }]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
     }
 
     #[test]
@@ -1324,6 +1390,38 @@ mod tests {
     }
 
     #[test]
+    fn app_9_moved_earlier_past_done_observation() {
+        // Seen done at DAY, then reopened and moved earlier to DAY/2: the
+        // only observation before DAY/2 (at 0) showed it open, so late.
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(2 * DAY))]), 0, &[]);
+        poll(
+            &mut l,
+            &snap(vec![done(obs(1, Some(2 * DAY)), DAY)]),
+            DAY,
+            &[],
+        );
+        let c = poll(&mut l, &snap(vec![obs(1, Some(DAY / 2))]), DAY + 10, &[]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Late, t(DAY + 10))]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY / 2)]);
+
+        // Seen done at 10, reopened at DAY, then moved earlier to DAY/2:
+        // the last observation before DAY/2 (at 10) showed it done, so met.
+        let mut m = Ledger::new();
+        poll(&mut m, &snap(vec![obs(1, Some(2 * DAY))]), 0, &[]);
+        poll(&mut m, &snap(vec![done(obs(1, Some(2 * DAY)), 5)]), 10, &[]);
+        poll(&mut m, &snap(vec![obs(1, Some(2 * DAY))]), DAY, &[]);
+        let c = poll(&mut m, &snap(vec![obs(1, Some(DAY / 2))]), DAY + 10, &[]);
+        assert_eq!(
+            decisions(&c),
+            vec![(OccurrenceId(0), Outcome::Met, t(DAY + 10))]
+        );
+    }
+
+    #[test]
     fn app_9_decided_on_first_poll_after_deadline_even_if_late_poll() {
         let mut l = Ledger::new();
         poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
@@ -1534,6 +1632,34 @@ mod tests {
         apply_all(&mut l, &c);
         assert_eq!(l.amount(), Centimes(1200));
         assert!(l.proposal().is_none());
+    }
+
+    #[test]
+    fn app_16_in_force_when_last_missing_witness_leaves() {
+        let mut l = Ledger::new();
+        l.apply(&l.propose_amount(Centimes(2000), t(1)).unwrap());
+        let c = l.approve_amount(A, &[A, B], t(2)).unwrap();
+        apply_all(&mut l, &c);
+        // B leaves: every current real witness has approved.
+        let c = l.approve_amount(A, &[A], t(3)).unwrap();
+        assert_eq!(
+            c,
+            vec![Change::AmountInForce {
+                amount: Centimes(2000),
+                at: t(3)
+            }]
+        );
+        apply_all(&mut l, &c);
+        assert_eq!(l.amount(), Centimes(2000));
+        assert!(l.proposal().is_none());
+        // Without B leaving, a repeat approval is still refused.
+        l.apply(&l.propose_amount(Centimes(1500), t(4)).unwrap());
+        let c = l.approve_amount(A, &[A, B], t(5)).unwrap();
+        apply_all(&mut l, &c);
+        assert_eq!(
+            l.approve_amount(A, &[A, B], t(6)),
+            Err(RuleError::AlreadyApproved)
+        );
     }
 
     #[test]
