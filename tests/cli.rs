@@ -198,3 +198,41 @@ fn cli_serve_fails_cleanly_without_vapid_key() {
     assert!(err.contains("gen-vapid"), "{err}");
     assert!(!err.contains("panicked"), "{err}");
 }
+
+// Regression (cli-review, APP-2 / DB-3): with the listen address taken,
+// `serve` must fail before the sync task starts, so a second process
+// never polls Vikunja (or writes the shared ledger) on its way out.
+#[test]
+fn cli_serve_busy_port_fails_before_polling_vikunja() {
+    let dir = temp_dir("serve-busy");
+    let keygen = run(command(&dir), &["gen-vapid"], "");
+    assert!(keygen.status.success(), "{}", stderr(&keygen));
+
+    // A reachable stand-in for Vikunja: any connection to it is a poll.
+    let vikunja = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake vikunja");
+    let vikunja_url = format!("http://{}", vikunja.local_addr().expect("vikunja addr"));
+    // The port `serve` is asked to listen on, already held here.
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind busy port");
+    let busy_addr = busy.local_addr().expect("busy addr").to_string();
+
+    let mut cmd = command(&dir);
+    cmd.env("ATOMANJA_VIKUNJA_URL", &vikunja_url);
+    let out = run(cmd, &["serve", &busy_addr], "");
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("bind"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+    // Startup stops at the bind: nothing after it (the sync task, the
+    // "listening" line) has run.
+    assert!(!err.contains("listening on"), "{err}");
+
+    // Connections the process opened stay in the accept queue after it
+    // exited; drain them without blocking.
+    vikunja.set_nonblocking(true).expect("nonblocking");
+    let mut polls = 0;
+    while vikunja.accept().is_ok() {
+        polls += 1;
+    }
+    assert_eq!(polls, 0, "serve polled Vikunja although it could not bind");
+    drop(busy);
+}

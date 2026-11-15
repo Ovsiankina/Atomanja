@@ -131,6 +131,15 @@ fn serve(addr: &str) -> Result<(), Failure> {
         mailer,
     };
 
+    // DECISION: probe the listen address with a std listener before the
+    // sync task starts, so a busy port fails here instead of after a
+    // second poller has already hit Vikunja, the shared ledger and push
+    // (APP-2, DB-3). The probe is dropped and web::serve binds again: a
+    // pre-bound listener would need a pub change to web::serve. The
+    // window between the two binds is microseconds, not a full poll.
+    std::net::TcpListener::bind(addr)
+        .map_err(|e| Failure::Failed(format!("web server: cannot bind the listen address {addr}: {e}")))?;
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
