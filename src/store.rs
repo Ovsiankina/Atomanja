@@ -905,8 +905,15 @@ impl From<rusqlite::Error> for StoreError {
 // `ledger::Change`, `seq` giving the append order (DB-3). Partial unique
 // indexes encode "at most once" per occurrence or debt, so a second claim,
 // a second debt for one occurrence or a replayed batch is refused by the
-// database itself (APP-12, Review Focus 3). Triggers forbid UPDATE and
-// DELETE on it (DB-2). `deadlines` holds the current recorded deadline per
+// database itself (APP-12, Review Focus 3).
+// DECISION: `changes_no_replay` makes a row identical in every column a
+// Conflict too, so a replayed batch of kinds the partial indexes do not
+// cover (SeenDone, Event, Amount*) is refused as `append` documents. Two
+// identical facts at the same instant are never two real facts. COALESCE
+// because NULLs are distinct in a unique index; -1 never occurs as a
+// stored value of these columns (ids and cents are unsigned, `sub` is a
+// small tag), and `kind` fixes which columns are NULL anyway.
+// Triggers forbid UPDATE and DELETE on it (DB-2). `deadlines` holds the current recorded deadline per
 // occurrence: the one value DB-2 lets change, and only to an earlier one
 // (APP-7).
 const SCHEMA: &str = "
@@ -926,6 +933,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS changes_once_per_occurrence
     ON changes (kind, occurrence) WHERE kind IN (0, 3, 4);
 CREATE UNIQUE INDEX IF NOT EXISTS changes_once_per_debt
     ON changes (kind, debt) WHERE kind IN (4, 5, 6, 7);
+CREATE UNIQUE INDEX IF NOT EXISTS changes_no_replay
+    ON changes (kind, at, COALESCE(occurrence, -1), COALESCE(debt, -1),
+                COALESCE(task, -1), COALESCE(witness, -1), COALESCE(amount, -1),
+                COALESCE(due, -1), COALESCE(sub, -1));
 CREATE TRIGGER IF NOT EXISTS changes_no_update BEFORE UPDATE ON changes
     BEGIN SELECT RAISE(ABORT, 'changes are insert-only (DB-2)'); END;
 CREATE TRIGGER IF NOT EXISTS changes_no_delete BEFORE DELETE ON changes
@@ -1338,6 +1349,56 @@ mod tests {
         let loaded = store.load_ledger().unwrap();
         assert_eq!(loaded.debts().occurrence.len(), 1);
         assert_eq!(store.load_changes().unwrap(), [first, late].concat());
+    }
+
+    /// Review regression: a replayed batch with no per-occurrence or
+    /// per-debt fact (a poll that only saw done flags or deadline events,
+    /// or amount changes) must also be refused, as `append` documents.
+    #[test]
+    fn store_replayed_batch_without_unique_kinds_conflicts() {
+        let mut store = Store::<LedgerDb>::open_in_memory().unwrap();
+        store.append(&[recorded(0, 1, 1000, 10)]).unwrap();
+        let poll = vec![
+            Change::SeenDone {
+                occurrence: OccurrenceId(0),
+                done: true,
+                at: Timestamp(20),
+            },
+            event(0, EventKind::MovedLater, Some(2000), 20),
+            event(0, EventKind::Removed, None, 30),
+        ];
+        store.append(&poll).unwrap();
+        assert!(matches!(store.append(&poll), Err(StoreError::Conflict)));
+        // Each single row of the batch is refused on its own too.
+        for row in &poll {
+            assert!(matches!(
+                store.append(std::slice::from_ref(row)),
+                Err(StoreError::Conflict)
+            ));
+        }
+
+        let amounts = vec![
+            Change::AmountProposed {
+                amount: Centimes(700),
+                at: Timestamp(40),
+            },
+            Change::AmountApproved {
+                witness: WitnessId(1),
+                at: Timestamp(41),
+            },
+            Change::AmountInForce {
+                amount: Centimes(700),
+                at: Timestamp(42),
+            },
+        ];
+        store.append(&amounts).unwrap();
+        assert!(matches!(store.append(&amounts), Err(StoreError::Conflict)));
+
+        // Same kind and occurrence at a later poll is a new fact, accepted.
+        store
+            .append(&[event(0, EventKind::MovedLater, Some(2000), 50)])
+            .unwrap();
+        assert_eq!(store.load_changes().unwrap().len(), 1 + 3 + 3 + 1);
     }
 
     // store-03
