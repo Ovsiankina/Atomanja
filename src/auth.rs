@@ -37,7 +37,10 @@ impl Role {
 
     /// Which database this role's requests use (APP-30, DEV-3).
     pub fn database(self) -> Database {
-        todo!()
+        match self {
+            Role::Worker | Role::Witness => Database::Ledger,
+            Role::Admin => Database::Dev,
+        }
     }
 }
 
@@ -152,11 +155,14 @@ const TOKEN_BYTES: usize = 32;
 /// Unpadded base64url (RFC 4648 section 5) of `bytes`.
 // DECISION: hand-rolled, about 15 lines, instead of adding a base64 crate.
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         // 1 input byte gives 2 chars, 2 give 3, 3 give 4.
         for i in 0..=chunk.len() {
@@ -230,8 +236,18 @@ pub enum Action {
 
 /// `true` if `actor` may do `action` (APP-20, APP-21, APP-27, APP-29).
 pub fn permits(actor: &Account, action: Action) -> bool {
-    let _ = (actor, action);
-    todo!()
+    let role = actor.role;
+    match action {
+        Action::ViewWorker | Action::MarkSent | Action::ProposeAmount | Action::CreateInvite => {
+            role == Role::Worker
+        }
+        // DECISION: the admin only reads, through the witness view
+        // (APP-30 "only ever reads"); claim, mark and approve need a real
+        // witness (APP-16, APP-20).
+        Action::ViewWitness => matches!(role, Role::Witness | Role::Admin),
+        Action::Claim | Action::MarkReceived | Action::ApproveAmount => role.is_real_witness(),
+        Action::ChangeEmail(owner) | Action::SetPassword(owner) => actor.id == owner,
+    }
 }
 
 /// `Ok` if a worker account may be created: none exists yet (APP-25).
@@ -276,8 +292,13 @@ impl std::fmt::Debug for Token {
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        f.write_str(match self {
+            AuthError::PasswordTooShort => "password is too short",
+            AuthError::Hashing => "password hashing failed",
+            AuthError::Expired => "token has expired",
+            AuthError::AlreadyUsed => "token was already used",
+            AuthError::WorkerExists => "a worker account already exists",
+        })
     }
 }
 
@@ -312,7 +333,10 @@ mod tests {
         assert!(verify_password(&hash, "correct horse"));
         assert!(!verify_password(&hash, "correct hors"));
         assert!(!verify_password(&hash, "Correct horse"));
-        assert!(!verify_password(&PasswordHash("not a phc".into()), "correct horse"));
+        assert!(!verify_password(
+            &PasswordHash("not a phc".into()),
+            "correct horse"
+        ));
     }
 
     #[test]
@@ -424,8 +448,81 @@ mod tests {
     }
 
     // auth-04
-    #[test] fn app_27_worker_cannot_set_witness_password() { todo!() }
-    #[test] fn app_29_only_owner_changes_email() { todo!() }
-    #[test] fn app_30_admin_targets_dev_db() { todo!() }
-    #[test] fn dev_3_worker_and_witness_target_ledger_db() { todo!() }
+    fn account(id: i64, role: Role) -> Account {
+        Account {
+            id: AccountId(id),
+            email: format!("a{id}@example.org"),
+            password_hash: PasswordHash(String::new()),
+            lang: crate::config::Lang::Fr,
+            role,
+        }
+    }
+
+    #[test]
+    fn app_27_worker_cannot_set_witness_password() {
+        let worker = account(1, Role::Worker);
+        let witness = account(2, Role::Witness);
+        let admin = account(3, Role::Admin);
+        assert!(!permits(&worker, Action::SetPassword(witness.id)));
+        assert!(!permits(&admin, Action::SetPassword(witness.id)));
+        assert!(!permits(&witness, Action::SetPassword(worker.id)));
+        assert!(permits(&witness, Action::SetPassword(witness.id)));
+        assert!(permits(&worker, Action::SetPassword(worker.id)));
+    }
+
+    #[test]
+    fn app_29_only_owner_changes_email() {
+        let worker = account(1, Role::Worker);
+        let witness = account(2, Role::Witness);
+        let other = account(4, Role::Witness);
+        assert!(permits(&witness, Action::ChangeEmail(witness.id)));
+        assert!(permits(&worker, Action::ChangeEmail(worker.id)));
+        assert!(!permits(&worker, Action::ChangeEmail(witness.id)));
+        assert!(!permits(&other, Action::ChangeEmail(witness.id)));
+    }
+
+    #[test]
+    fn app_30_admin_targets_dev_db() {
+        assert_eq!(Role::Admin.database(), Database::Dev);
+        let admin = account(3, Role::Admin);
+        // Witness view over dev data only, read-only (APP-20, APP-30).
+        assert!(permits(&admin, Action::ViewWitness));
+        for action in [
+            Action::ViewWorker,
+            Action::Claim,
+            Action::MarkSent,
+            Action::MarkReceived,
+            Action::ProposeAmount,
+            Action::ApproveAmount,
+            Action::CreateInvite,
+        ] {
+            assert!(!permits(&admin, action), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn dev_3_worker_and_witness_target_ledger_db() {
+        assert_eq!(Role::Worker.database(), Database::Ledger);
+        assert_eq!(Role::Witness.database(), Database::Ledger);
+        let worker = account(1, Role::Worker);
+        let witness = account(2, Role::Witness);
+        for action in [
+            Action::ViewWorker,
+            Action::MarkSent,
+            Action::ProposeAmount,
+            Action::CreateInvite,
+        ] {
+            assert!(permits(&worker, action), "{action:?}");
+            assert!(!permits(&witness, action), "{action:?}");
+        }
+        for action in [
+            Action::ViewWitness,
+            Action::Claim,
+            Action::MarkReceived,
+            Action::ApproveAmount,
+        ] {
+            assert!(permits(&witness, action), "{action:?}");
+            assert!(!permits(&worker, action), "{action:?}");
+        }
+    }
 }
