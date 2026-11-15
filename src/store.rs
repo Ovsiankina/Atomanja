@@ -20,6 +20,15 @@
 //! a replayed batch, fail with [`StoreError::Conflict`] and write
 //! nothing (Review Focus 3, APP-12).
 //!
+//! A dev handle does not compile where a ledger handle is required:
+//!
+//! ```compile_fail
+//! use atomanja::store::{DevDb, LedgerDb, Store};
+//! fn ledger_only(_: &Store<LedgerDb>) {}
+//! let dev = Store::<DevDb>::open_in_memory().unwrap();
+//! ledger_only(&dev);
+//! ```
+//!
 //! TODO(srs) DEV-3: which file holds the admin account and its sessions
 //! is open (login reads accounts before the role is known). Account and
 //! token methods are generic over `K`, so either answer fits this
@@ -85,8 +94,11 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Sqlite`] when the file cannot be opened or the
     /// schema cannot be created.
     pub fn open(path: &Path) -> Result<Store<K>, StoreError> {
-        let _ = path;
-        todo!()
+        let conn = rusqlite::Connection::open(path)?;
+        // DECISION: wait up to 5 s for a lock instead of failing at once,
+        // so two requests writing the same file serialise (Review Focus 3).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::with_schema(conn)
     }
 
     /// A fresh in-memory database with the schema, for tests.
@@ -95,12 +107,21 @@ impl<K: Kind> Store<K> {
     ///
     /// [`StoreError::Sqlite`] when the schema cannot be created.
     pub fn open_in_memory() -> Result<Store<K>, StoreError> {
-        todo!()
+        Self::with_schema(rusqlite::Connection::open_in_memory()?)
     }
 
     /// Which file this handle is open on (DEV-3).
     pub fn database(&self) -> Database {
-        todo!()
+        K::DATABASE
+    }
+
+    /// Create the schema if absent and wrap the connection.
+    fn with_schema(conn: rusqlite::Connection) -> Result<Store<K>, StoreError> {
+        conn.execute_batch(SCHEMA)?;
+        Ok(Store {
+            conn,
+            kind: PhantomData,
+        })
     }
 
     // --- ledger facts (DB-2, DB-3) ---
@@ -330,44 +351,210 @@ pub enum StoreError {
 
 impl std::fmt::Debug for StoredSubscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        f.debug_struct("StoredSubscription")
+            .field("account", &self.account)
+            .field("endpoint", &self.endpoint)
+            .field("p256dh", &"<hidden>")
+            .field("auth", &"<hidden>")
+            .finish()
     }
 }
 
 impl<K: Kind> std::fmt::Debug for Store<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = (f, &self.conn, self.kind);
-        todo!()
+        f.debug_struct("Store")
+            .field("database", &K::DATABASE)
+            .field("path", &self.conn.path())
+            .finish_non_exhaustive()
     }
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        match self {
+            StoreError::Conflict => f.write_str("row already exists"),
+            StoreError::NotFound => f.write_str("no such row"),
+            StoreError::Corrupt(what) => write!(f, "stored row does not decode: {what}"),
+            StoreError::Sqlite(err) => write!(f, "sqlite: {err}"),
+        }
     }
 }
 
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        todo!()
+        match self {
+            StoreError::Sqlite(err) => Some(err),
+            _ => None,
+        }
     }
 }
 
 impl From<rusqlite::Error> for StoreError {
     fn from(err: rusqlite::Error) -> Self {
-        let _ = err;
-        todo!()
+        // DECISION: only UNIQUE and PRIMARY KEY violations are a Conflict
+        // (a row already exists); a trigger refusing an update or delete,
+        // or any other failure, stays a Sqlite error.
+        if let rusqlite::Error::SqliteFailure(e, _) = &err
+            && matches!(
+                e.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            )
+        {
+            return StoreError::Conflict;
+        }
+        StoreError::Sqlite(err)
     }
 }
 
+/// The schema of both files. Every statement is `IF NOT EXISTS`, so
+/// opening an existing file is a no-op (idempotent creation).
+// DECISION: ledger facts are one insert-only `changes` table, one row per
+// `ledger::Change`, `seq` giving the append order (DB-3). Partial unique
+// indexes encode "at most once" per occurrence or debt, so a second claim,
+// a second debt for one occurrence or a replayed batch is refused by the
+// database itself (APP-12, Review Focus 3). Triggers forbid UPDATE and
+// DELETE on it (DB-2). `deadlines` holds the current recorded deadline per
+// occurrence: the one value DB-2 lets change, and only to an earlier one
+// (APP-7).
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS changes (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       INTEGER NOT NULL,
+    at         INTEGER NOT NULL,
+    occurrence INTEGER,
+    debt       INTEGER,
+    task       INTEGER,
+    witness    INTEGER,
+    amount     INTEGER,
+    due        INTEGER,
+    sub        INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS changes_once_per_occurrence
+    ON changes (kind, occurrence) WHERE kind IN (0, 3, 4);
+CREATE UNIQUE INDEX IF NOT EXISTS changes_once_per_debt
+    ON changes (kind, debt) WHERE kind IN (4, 5, 6, 7);
+CREATE TRIGGER IF NOT EXISTS changes_no_update BEFORE UPDATE ON changes
+    BEGIN SELECT RAISE(ABORT, 'changes are insert-only (DB-2)'); END;
+CREATE TRIGGER IF NOT EXISTS changes_no_delete BEFORE DELETE ON changes
+    BEGIN SELECT RAISE(ABORT, 'changes are insert-only (DB-2)'); END;
+
+CREATE TABLE IF NOT EXISTS deadlines (
+    occurrence INTEGER PRIMARY KEY,
+    deadline   INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS deadlines_only_earlier BEFORE UPDATE ON deadlines
+    WHEN NEW.occurrence IS NOT OLD.occurrence OR NEW.deadline >= OLD.deadline
+    BEGIN SELECT RAISE(ABORT, 'a recorded deadline only moves earlier (APP-7)'); END;
+CREATE TRIGGER IF NOT EXISTS deadlines_no_delete BEFORE DELETE ON deadlines
+    BEGIN SELECT RAISE(ABORT, 'recorded deadlines are never deleted (DB-2)'); END;
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    lang          TEXT NOT NULL,
+    role          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tokens (
+    secret    TEXT PRIMARY KEY,
+    kind      INTEGER NOT NULL,
+    account   INTEGER,
+    issued_at INTEGER NOT NULL,
+    used      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    account  INTEGER NOT NULL,
+    p256dh   TEXT NOT NULL,
+    auth     TEXT NOT NULL
+);
+";
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A fresh path in the system temp dir, removed on drop.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str) -> TempFile {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let name = format!("atomanja-store-{tag}-{}-{n}.sqlite", std::process::id());
+            let path = std::env::temp_dir().join(name);
+            let _ = std::fs::remove_file(&path);
+            TempFile(path)
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let mut p = self.0.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    fn tables<K: Kind>(store: &Store<K>) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
     // store-01
-    #[test] fn db_1_creates_schema_in_new_file() { todo!() }
-    #[test] fn dev_1_dev_handle_reports_dev_database() { todo!() }
-    #[test] fn dev_3_dev_handle_not_accepted_where_ledger_required() { todo!() }
+    #[test]
+    fn db_1_creates_schema_in_new_file() {
+        let file = TempFile::new("db1");
+        assert!(!file.0.exists());
+        let store = Store::<LedgerDb>::open(&file.0).unwrap();
+        assert!(file.0.exists());
+        let names = tables(&store);
+        for t in ["accounts", "changes", "deadlines", "subscriptions", "tokens"] {
+            assert!(names.iter().any(|n| n == t), "missing table {t}: {names:?}");
+        }
+        drop(store);
+        // Opening again keeps the schema (idempotent creation).
+        let again = Store::<LedgerDb>::open(&file.0).unwrap();
+        assert_eq!(tables(&again), names);
+    }
+
+    #[test]
+    fn dev_1_dev_handle_reports_dev_database() {
+        let dev = Store::<DevDb>::open_in_memory().unwrap();
+        assert_eq!(dev.database(), Database::Dev);
+        let ledger = Store::<LedgerDb>::open_in_memory().unwrap();
+        assert_eq!(ledger.database(), Database::Ledger);
+        let debug = format!("{dev:?}");
+        assert!(debug.contains("Dev"), "{debug}");
+    }
+
+    #[test]
+    fn dev_3_dev_handle_not_accepted_where_ledger_required() {
+        // The compile-time half is the `compile_fail` doc test in the
+        // module docs. Here: the two handle types are distinct types.
+        use std::any::TypeId;
+        fn ledger_only(store: &Store<LedgerDb>) -> Database {
+            store.database()
+        }
+        assert_ne!(
+            TypeId::of::<Store<LedgerDb>>(),
+            TypeId::of::<Store<DevDb>>()
+        );
+        let ledger = Store::<LedgerDb>::open_in_memory().unwrap();
+        assert_eq!(ledger_only(&ledger), Database::Ledger);
+    }
 
     // store-02
     #[test] fn db_2_ledger_rows_insert_only() { todo!() }
