@@ -34,13 +34,15 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::ledger::{Change, TaskId, Timestamp};
-use crate::notify::{Message, Notifier, SendReport, Subscription};
+use time::OffsetDateTime;
+
+use crate::ledger::{Change, Observation, RepeatMode, Snapshot, TaskId, Timestamp};
+use crate::notify::{self, Message, Notifier, SendReport, Subscription};
 use crate::store::{LedgerDb, Store, StoreError};
-use crate::vikunja::{PageSource, VikunjaError};
+use crate::vikunja::{self, PageSource, Task, VikunjaError};
 
 /// Where notifications go: the real [`Notifier`], or a fake in tests.
 pub trait Push {
@@ -60,9 +62,90 @@ impl Push for Notifier {
         message: &Message,
         subscriptions: &[Subscription],
     ) -> impl Future<Output = SendReport> + Send {
-        let _ = (message, subscriptions);
-        async move { todo!() }
+        self.send(message, subscriptions)
     }
+}
+
+/// Map one Vikunja record to what the ledger observes (APP-3, APP-8).
+/// `sync` owns this mapping (no `vikunja -> ledger` arrow).
+fn observation(task: &Task) -> Observation {
+    Observation {
+        due: task.due.map(timestamp),
+        done_at: task.done_at.map(timestamp),
+        task: TaskId(task.id),
+        // DECISION: a negative or oversized `repeat_after` is clamped
+        // into u32 (0 = not recurring, or the maximum) rather than
+        // failing the whole poll over one odd task.
+        repeat_after_secs: u32::try_from(task.repeat_after_secs.max(0)).unwrap_or(u32::MAX),
+        // DECISION: an unknown raw `repeat_mode` counts as the Vikunja
+        // default (interval), which is what Vikunja itself falls back to.
+        repeat_mode: match task.repeat_mode {
+            1 => RepeatMode::Monthly,
+            2 => RepeatMode::FromDone,
+            _ => RepeatMode::Interval,
+        },
+        done: task.done,
+        archived: task.project_archived,
+    }
+}
+
+fn timestamp(at: OffsetDateTime) -> Timestamp {
+    Timestamp(at.unix_timestamp())
+}
+
+/// A lock that a panicking holder poisoned is still consistent here:
+/// every store write is one transaction, the title map one assignment.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Messages to send after the lock is released, each with its devices.
+type Outbox = Vec<(Message, Vec<Subscription>)>;
+
+/// The synchronous, locked part of a poll (step 2 of [`poll_once`]).
+fn apply(
+    store: &mut Store<LedgerDb>,
+    tasks: &[Task],
+    now: Timestamp,
+) -> Result<(Vec<Change>, Outbox), StoreError> {
+    let mut ledger = store.load_ledger()?;
+    let witnesses = store.real_witnesses()?;
+    // DECISION: accounts and devices are read before the append, so no
+    // read can fail after the batch is written; a poll then either
+    // reports its persisted changes or wrote nothing.
+    let accounts = store.accounts()?;
+    let mut devices = BTreeMap::new();
+    for account in &accounts {
+        let subs: Vec<Subscription> = store
+            .subscriptions(account.id)?
+            .into_iter()
+            .map(|s| Subscription {
+                endpoint: s.endpoint,
+                p256dh: s.p256dh,
+                auth: s.auth,
+            })
+            .collect();
+        devices.insert(account.id, subs);
+    }
+    let snapshot = Snapshot {
+        tasks: tasks.iter().map(observation).collect(),
+    };
+    let changes = ledger.observe(&snapshot, now, &witnesses);
+    if changes.is_empty() {
+        return Ok((changes, Vec::new()));
+    }
+    store.append(&changes)?;
+    for change in &changes {
+        ledger.apply(change);
+    }
+    let outbox = notify::messages(&changes, &ledger, &accounts)
+        .into_iter()
+        .map(|m| {
+            let subs = devices.get(&m.to).cloned().unwrap_or_default();
+            (m, subs)
+        })
+        .collect();
+    Ok((changes, outbox))
 }
 
 // DECISION: titles travel in a std BTreeMap (ordered by task number,
@@ -105,8 +188,27 @@ where
     S: PageSource + Sync,
     P: Push + Sync,
 {
-    let _ = (source, store, titles, push, now);
-    todo!()
+    let tasks = vikunja::fetch_all(source).await.map_err(SyncError::Fetch)?;
+    let (changes, outbox) = {
+        let mut store = lock(store);
+        apply(&mut store, &tasks, now).map_err(SyncError::Store)?
+    };
+    *lock(titles) = tasks.into_iter().map(|t| (TaskId(t.id), t.title)).collect();
+    let mut gone = Vec::new();
+    for (message, subscriptions) in &outbox {
+        gone.extend(push.push(message, subscriptions).await.gone);
+    }
+    if !gone.is_empty() {
+        let mut store = lock(store);
+        for endpoint in &gone {
+            // DECISION: a failed cleanup is logged, not returned: the batch
+            // is already persisted and push failures are never errors.
+            if let Err(e) = store.remove_subscription(endpoint) {
+                eprintln!("sync: could not remove a gone push subscription: {e}");
+            }
+        }
+    }
+    Ok(changes)
 }
 
 /// The poll loop (APP-2, DB-3): one [`poll_once`] immediately, then one
@@ -123,8 +225,18 @@ pub async fn run<S, P>(
     S: PageSource + Sync,
     P: Push + Sync,
 {
-    let _ = (source, store, titles, push, interval);
-    todo!()
+    // DECISION: a poll slower than the interval delays the next tick
+    // instead of firing a burst of catch-up polls.
+    let mut ticks = tokio::time::interval(interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // The first tick completes at once: the startup poll (DB-3).
+        ticks.tick().await;
+        let now = timestamp(OffsetDateTime::now_utc());
+        if let Err(e) = poll_once(source, store, titles, push, now).await {
+            eprintln!("sync: poll failed, retrying next interval: {e}");
+        }
+    }
 }
 
 /// Why one poll changed nothing.
@@ -151,11 +263,317 @@ impl std::error::Error for SyncError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::{Push, poll_once, run};
+    use crate::auth::{AccountId, PasswordHash, Role};
+    use crate::ledger::{Change, Outcome, TaskId, Timestamp};
+    use crate::notify::{Message, MessageKind, SendReport, Subscription};
+    use crate::store::{LedgerDb, Store, StoredSubscription};
+    use crate::vikunja::{Page, PageSource, Resource, VikunjaError};
+
+    /// 2020-01-01T00:00:00Z, the fixture task's due date. In the past,
+    /// so [`run`]'s wall clock is always after it.
+    const DUE: i64 = 1_577_836_800;
+
+    /// Serves one task page and one project page, or fails a chosen one.
+    struct FakeSource {
+        tasks: String,
+        fail: Option<Resource>,
+        polls: AtomicUsize,
+    }
+
+    impl FakeSource {
+        fn task(done: bool, done_at: &str) -> FakeSource {
+            FakeSource {
+                tasks: format!(
+                    r#"[{{"id":42,"title":"Pay rent","project_id":7,"done":{done},
+                        "due_date":"2020-01-01T00:00:00Z","done_at":"{done_at}",
+                        "repeat_after":0,"repeat_mode":0}}]"#
+                ),
+                fail: None,
+                polls: AtomicUsize::new(0),
+            }
+        }
+
+        fn open() -> FakeSource {
+            FakeSource::task(false, "0001-01-01T00:00:00Z")
+        }
+    }
+
+    impl PageSource for FakeSource {
+        async fn page(&self, resource: Resource, page: u32) -> Result<Page, VikunjaError> {
+            if resource == Resource::Tasks && page == 1 {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.fail == Some(resource) {
+                return Err(VikunjaError::Transport("connection refused".into()));
+            }
+            let body = match resource {
+                Resource::Tasks => self.tasks.clone(),
+                Resource::Projects => r#"[{"id":7,"is_archived":false}]"#.to_owned(),
+            };
+            Ok(Page {
+                body,
+                total_pages: 1,
+            })
+        }
+    }
+
+    /// Records every push; reports the listed endpoints as gone.
+    #[derive(Default)]
+    struct FakePush {
+        sent: Mutex<Vec<(Message, Vec<Subscription>)>>,
+        gone: Vec<String>,
+    }
+
+    impl Push for FakePush {
+        async fn push(&self, message: &Message, subscriptions: &[Subscription]) -> SendReport {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((message.clone(), subscriptions.to_vec()));
+            let gone: Vec<String> = subscriptions
+                .iter()
+                .map(|s| s.endpoint.clone())
+                .filter(|e| self.gone.contains(e))
+                .collect();
+            SendReport {
+                delivered: subscriptions.len() - gone.len(),
+                failed: gone.len(),
+                gone,
+            }
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// A worker and one real witness, each with one device.
+    fn people(store: &mut Store<LedgerDb>) -> (AccountId, AccountId) {
+        let hash = PasswordHash("x".into());
+        let worker = store.insert_account("w@x", &hash, Role::Worker).unwrap().id;
+        let witness = store
+            .insert_account("v@x", &hash, Role::Witness)
+            .unwrap()
+            .id;
+        for (account, endpoint) in [
+            (worker, "https://push/worker"),
+            (witness, "https://push/witness"),
+        ] {
+            store
+                .upsert_subscription(&StoredSubscription {
+                    account,
+                    endpoint: endpoint.into(),
+                    p256dh: "k".into(),
+                    auth: "a".into(),
+                })
+                .unwrap();
+        }
+        (worker, witness)
+    }
+
+    fn fresh() -> (Mutex<Store<LedgerDb>>, AccountId, AccountId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let (worker, witness) = people(&mut store);
+        (Mutex::new(store), worker, witness)
+    }
+
+    fn titles() -> Mutex<BTreeMap<TaskId, String>> {
+        Mutex::new(BTreeMap::new())
+    }
+
+    fn changes(store: &Mutex<Store<LedgerDb>>) -> Vec<Change> {
+        store.lock().unwrap().load_changes().unwrap()
+    }
+
+    fn decisions(store: &Mutex<Store<LedgerDb>>) -> Vec<Outcome> {
+        changes(store)
+            .into_iter()
+            .filter_map(|c| match c {
+                Change::Decided { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
     // sync-01
-    #[test] fn sync_successful_poll_applies_persists_notifies() { todo!() }
-    #[test] fn db_3_first_poll_runs_at_startup() { todo!() }
+    #[test]
+    fn sync_successful_poll_applies_persists_notifies() {
+        let (store, worker, witness) = fresh();
+        let titles = titles();
+        let push = FakePush {
+            gone: vec!["https://push/witness".into()],
+            ..FakePush::default()
+        };
+        let source = FakeSource::open();
+
+        // Before the deadline: recorded, persisted, nothing notified.
+        let first = block_on(poll_once(
+            &source,
+            &store,
+            &titles,
+            &push,
+            Timestamp(DUE - 60),
+        ))
+        .unwrap();
+        assert!(matches!(
+            first.as_slice(),
+            [Change::Recorded {
+                task: TaskId(42),
+                deadline: Timestamp(DUE),
+                ..
+            }]
+        ));
+        assert_eq!(changes(&store), first);
+        assert_eq!(
+            titles.lock().unwrap().get(&TaskId(42)).map(String::as_str),
+            Some("Pay rent")
+        );
+        assert!(push.sent.lock().unwrap().is_empty());
+
+        // After it, still open: late, debt, auto-claimed by the only witness.
+        let second = block_on(poll_once(
+            &source,
+            &store,
+            &titles,
+            &push,
+            Timestamp(DUE + 60),
+        ))
+        .unwrap();
+        assert!(matches!(
+            second.as_slice(),
+            [
+                Change::Decided {
+                    outcome: Outcome::Late,
+                    ..
+                },
+                Change::DebtCreated { .. },
+                Change::Claimed {
+                    automatic: true,
+                    ..
+                },
+            ]
+        ));
+        assert_eq!(changes(&store), [first, second].concat());
+
+        // APP-34/35: "claimed for you" to the witness, "claimed" to the
+        // worker, each with that person's devices.
+        let sent = push.sent.lock().unwrap();
+        let got: Vec<(MessageKind, AccountId, TaskId, Vec<&str>)> = sent
+            .iter()
+            .map(|(m, subs)| {
+                let endpoints = subs.iter().map(|s| s.endpoint.as_str()).collect();
+                (m.kind, m.to, m.task, endpoints)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    MessageKind::ClaimedForYou,
+                    witness,
+                    TaskId(42),
+                    vec!["https://push/witness"]
+                ),
+                (
+                    MessageKind::Claimed,
+                    worker,
+                    TaskId(42),
+                    vec!["https://push/worker"]
+                ),
+            ]
+        );
+        // The device reported gone is forgotten.
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .subscriptions(witness)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn db_3_first_poll_runs_at_startup() {
+        let path =
+            std::env::temp_dir().join(format!("atomanja-sync-db3-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let push = FakePush::default();
+        // Before the restart: the deadline is recorded, still in the future.
+        {
+            let mut store = Store::<LedgerDb>::open(&path).unwrap();
+            people(&mut store);
+            let store = Mutex::new(store);
+            let source = FakeSource::open();
+            block_on(poll_once(
+                &source,
+                &store,
+                &titles(),
+                &push,
+                Timestamp(DUE - 60),
+            ))
+            .unwrap();
+        }
+        // The deadline passed while down. Restart: the loop polls at once,
+        // without waiting its (long) interval, and decides (DB-3, APP-9).
+        let store = Mutex::new(Store::<LedgerDb>::open(&path).unwrap());
+        let titles = titles();
+        let source = FakeSource::open();
+        let ran = block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                run(&source, &store, &titles, &push, Duration::from_secs(3600)),
+            )
+            .await
+        });
+        assert!(ran.is_err(), "run never returns");
+        assert_eq!(source.polls.load(Ordering::SeqCst), 1);
+        assert_eq!(decisions(&store), [Outcome::Late]);
+        assert!(titles.lock().unwrap().contains_key(&TaskId(42)));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_polls_again_every_interval() {
+        let (store, _, _) = fresh();
+        let source = FakeSource::open();
+        let push = FakePush::default();
+        let ran = block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                run(
+                    &source,
+                    &store,
+                    &titles(),
+                    &push,
+                    Duration::from_millis(100),
+                ),
+            )
+            .await
+        });
+        assert!(ran.is_err());
+        // At 0, 100 and 200 ms.
+        assert_eq!(source.polls.load(Ordering::SeqCst), 3);
+    }
 
     // sync-02
-    #[test] fn sync_failed_fetch_changes_nothing() { todo!() }
-    #[test] fn app_9_decisions_deferred_until_successful_poll() { todo!() }
+    #[test]
+    fn sync_failed_fetch_changes_nothing() {
+        todo!()
+    }
+    #[test]
+    fn app_9_decisions_deferred_until_successful_poll() {
+        todo!()
+    }
 }
