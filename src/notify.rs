@@ -104,7 +104,11 @@ impl Message {
     /// The JSON push payload the service worker displays: title, body
     /// and the URL to open.
     pub fn payload(&self) -> String {
-        todo!()
+        let text = self.text();
+        // DECISION: the URL is the site root, relative, so the service
+        // worker resolves it against its own origin and the root page
+        // sends each role to its view.
+        serde_json::json!({ "title": text.title, "body": text.body, "url": "/" }).to_string()
     }
 }
 
@@ -250,6 +254,9 @@ pub struct Subscription {
 #[derive(Clone, PartialEq, Eq)]
 pub struct VapidKeys {
     private_b64: String,
+    // DECISION: the public key is derived once when the private key is
+    // validated, so `public_key` cannot fail or panic later.
+    public_b64: String,
 }
 
 impl VapidKeys {
@@ -259,7 +266,22 @@ impl VapidKeys {
     ///
     /// [`NotifyError::Key`] if no valid key could be produced.
     pub fn generate() -> Result<VapidKeys, NotifyError> {
-        todo!()
+        use rand::TryRng;
+        // DECISION: a random 32-byte scalar is a valid P-256 key except
+        // with probability ~2^-32 (zero or >= the group order); retry a
+        // few times rather than pull in a key-generation crate.
+        let mut last = String::new();
+        for _ in 0..4 {
+            let mut bytes = [0u8; 32];
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut bytes)
+                .map_err(|e| NotifyError::Key(format!("OS random number generator failed: {e}")))?;
+            match VapidKeys::from_private(base64url(&bytes)) {
+                Ok(keys) => return Ok(keys),
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(NotifyError::Key(last))
     }
 
     /// Load the private key file written by [`VapidKeys::save`].
@@ -269,8 +291,8 @@ impl VapidKeys {
     /// [`NotifyError::Io`] when the file cannot be read,
     /// [`NotifyError::Key`] when it holds no valid key.
     pub fn load(path: &Path) -> Result<VapidKeys, NotifyError> {
-        let _ = path;
-        todo!()
+        let text = std::fs::read_to_string(path).map_err(NotifyError::Io)?;
+        VapidKeys::from_private(text.trim().to_owned())
     }
 
     /// Write the private key file.
@@ -279,15 +301,53 @@ impl VapidKeys {
     ///
     /// [`NotifyError::Io`] when the file cannot be written.
     pub fn save(&self, path: &Path) -> Result<(), NotifyError> {
-        let _ = path;
-        todo!()
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // DECISION: a new key file is created owner-read/write only.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(path).map_err(NotifyError::Io)?;
+        writeln!(file, "{}", self.private_b64).map_err(NotifyError::Io)
     }
 
     /// The public key, base64url, as the browser's
     /// `applicationServerKey` (APP-33).
     pub fn public_key(&self) -> String {
-        todo!()
+        self.public_b64.clone()
     }
+
+    /// Validate a base64url raw private key and derive its public key.
+    fn from_private(private_b64: String) -> Result<VapidKeys, NotifyError> {
+        let builder = web_push::VapidSignatureBuilder::from_base64_no_sub(&private_b64)
+            .map_err(|_| NotifyError::Key("not a base64url raw P-256 private key".into()))?;
+        let public_b64 = base64url(&builder.get_public_key());
+        Ok(VapidKeys {
+            private_b64,
+            public_b64,
+        })
+    }
+}
+
+/// Unpadded base64url (RFC 4648 section 5) of `bytes`.
+// DECISION: hand-rolled, as in `auth`, instead of a base64 dependency.
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..=chunk.len() {
+            let sextet = (n >> (18 - 6 * i)) & 0x3f;
+            out.push(char::from(ALPHABET[sextet as usize]));
+        }
+    }
+    out
 }
 
 /// Outcome of one [`Notifier::send`]. Not an error type: failures are
@@ -315,16 +375,78 @@ impl Notifier {
     // no contact address and a URL is valid per RFC 8292.
     /// A sender using `keys`, with `config.base_url` as VAPID subject.
     pub fn new(keys: VapidKeys, config: &Config) -> Notifier {
-        let _ = (keys, config);
-        todo!()
+        Notifier {
+            keys,
+            subject: config.base_url.clone(),
+            client: web_push::HyperWebPushClient::new(),
+        }
     }
 
     /// Push `message` to every device in `subscriptions` (APP-33).
     /// Never fails: each failure is logged to stderr and counted.
     pub async fn send(&self, message: &Message, subscriptions: &[Subscription]) -> SendReport {
-        let _ = (message, subscriptions);
-        todo!()
+        let payload = message.payload();
+        let mut report = SendReport::default();
+        // DECISION: devices are pushed one after another; a user has a
+        // handful of devices and four events, so no fan-out machinery.
+        for sub in subscriptions {
+            let result = self.push_one(&payload, sub).await;
+            tally(&mut report, &sub.endpoint, result);
+        }
+        report
     }
+
+    /// Sign, encrypt and send `payload` to one device.
+    async fn push_one(
+        &self,
+        payload: &str,
+        sub: &Subscription,
+    ) -> Result<(), web_push::WebPushError> {
+        use web_push::WebPushClient;
+        let info = web_push::SubscriptionInfo::new(
+            sub.endpoint.as_str(),
+            sub.p256dh.as_str(),
+            sub.auth.as_str(),
+        );
+        let mut signature =
+            web_push::VapidSignatureBuilder::from_base64(&self.keys.private_b64, &info)?;
+        signature.add_claim("sub", self.subject.as_str());
+        let mut builder = web_push::WebPushMessageBuilder::new(&info);
+        builder.set_payload(web_push::ContentEncoding::Aes128Gcm, payload.as_bytes());
+        builder.set_vapid_signature(signature.build()?);
+        self.client.send(builder.build()?).await
+    }
+}
+
+/// Count one device's outcome into `report`, logging every failure.
+fn tally(report: &mut SendReport, endpoint: &str, result: Result<(), web_push::WebPushError>) {
+    use web_push::WebPushError;
+    match result {
+        Ok(()) => report.delivered += 1,
+        Err(e @ (WebPushError::EndpointNotValid(_) | WebPushError::EndpointNotFound(_))) => {
+            eprintln!(
+                "notify: push endpoint at {} is gone: {}",
+                origin(endpoint),
+                e.short_description()
+            );
+            report.gone.push(endpoint.to_owned());
+        }
+        Err(e) => {
+            eprintln!(
+                "notify: push to {} failed: {}",
+                origin(endpoint),
+                e.short_description()
+            );
+            report.failed += 1;
+        }
+    }
+}
+
+/// `scheme://host` of an endpoint, for logs.
+// DECISION: logs never show the endpoint path: it is the device's
+// bearer capability at the push service.
+fn origin(endpoint: &str) -> String {
+    endpoint.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")
 }
 
 /// Why a VAPID key could not be generated, loaded or saved.
@@ -336,43 +458,62 @@ pub enum NotifyError {
     Key(String),
 }
 
+/// Stands in for a secret in `Debug` output.
+const REDACTED: &str = "<redacted>";
+
 impl std::fmt::Debug for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        f.debug_struct("Subscription")
+            .field("endpoint", &self.endpoint)
+            .field("p256dh", &REDACTED)
+            .field("auth", &REDACTED)
+            .finish()
     }
 }
 
 impl std::fmt::Debug for VapidKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        f.debug_struct("VapidKeys")
+            .field("public", &self.public_b64)
+            .field("private", &REDACTED)
+            .finish()
     }
 }
 
 impl std::fmt::Debug for Notifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = (f, &self.keys, &self.subject, &self.client);
-        todo!()
+        f.debug_struct("Notifier")
+            .field("keys", &self.keys)
+            .field("subject", &self.subject)
+            .finish_non_exhaustive()
     }
 }
 
 impl std::fmt::Display for NotifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        match self {
+            NotifyError::Io(e) => write!(f, "VAPID key file: {e}"),
+            NotifyError::Key(why) => write!(f, "invalid VAPID key: {why}"),
+        }
     }
 }
 
 impl std::error::Error for NotifyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        todo!()
+        match self {
+            NotifyError::Io(e) => Some(e),
+            NotifyError::Key(_) => None,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{messages, Message, MessageKind};
+    use super::{
+        messages, tally, Message, MessageKind, Notifier, NotifyError, SendReport, Subscription,
+        VapidKeys,
+    };
+    use crate::config::Config;
     use crate::auth::{Account, AccountId, PasswordHash, Role};
     use crate::config::Lang;
     use crate::ledger::{
@@ -544,13 +685,133 @@ mod tests {
                 .filter(char::is_ascii_digit)
                 .collect();
             assert_eq!(digits, "421250", "only task number and amount: {text:?}");
+            // The push payload carries exactly that text and a URL.
+            let payload: serde_json::Value =
+                serde_json::from_str(&msg(ALICE, kind).payload()).unwrap();
+            assert_eq!(
+                payload,
+                serde_json::json!({"title": text.title, "body": text.body, "url": "/"})
+            );
         }
     }
 
     // notify-02
-    #[test] fn app_33_vapid_key_roundtrip() { todo!() }
-    #[test] fn notify_send_failure_is_logged_not_returned() { todo!() }
-    #[test] fn notify_debug_hides_secrets() { todo!() }
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("atomanja-notify-{}-{name}", std::process::id()))
+    }
+
+    fn config() -> Config {
+        let get = |k: &str| {
+            let v = match k {
+                "ATOMANJA_DB" => "/data/ledger.db",
+                "ATOMANJA_DEV_DB" => "/data/dev.db",
+                "ATOMANJA_VIKUNJA_URL" => "https://vikunja.example",
+                "ATOMANJA_VIKUNJA_TOKEN" => "tok",
+                "ATOMANJA_BASE_URL" => "https://atomanja.example",
+                "ATOMANJA_SMTP_HOST" => "smtp.example",
+                "ATOMANJA_SMTP_USER" => "mailer",
+                "ATOMANJA_SMTP_PASSWORD" => "pw",
+                "ATOMANJA_SMTP_FROM" => "noreply@atomanja.example",
+                "ATOMANJA_VAPID_KEY" => "/data/vapid.key",
+                _ => return None,
+            };
+            Some(v.to_owned())
+        };
+        Config::from_source(get).expect("test config")
+    }
+
+    #[test]
+    fn app_33_vapid_key_roundtrip() {
+        let keys = VapidKeys::generate().unwrap();
+        let public = keys.public_key();
+        // Uncompressed P-256 point: 65 bytes, 0x04 first, 87 base64url chars.
+        assert_eq!(public.len(), 87, "{public}");
+        assert!(public.starts_with('B'), "{public}");
+        assert_ne!(VapidKeys::generate().unwrap(), keys);
+
+        let path = temp_path("roundtrip");
+        keys.save(&path).unwrap();
+        let loaded = VapidKeys::load(&path).unwrap();
+        assert_eq!(loaded, keys);
+        assert_eq!(loaded.public_key(), public);
+
+        std::fs::write(&path, "not a key\n").unwrap();
+        assert!(matches!(VapidKeys::load(&path), Err(NotifyError::Key(_))));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(VapidKeys::load(&path), Err(NotifyError::Io(_))));
+    }
+
+    #[test]
+    fn notify_send_failure_is_logged_not_returned() {
+        let keys = VapidKeys::generate().unwrap();
+        // A valid browser key: any uncompressed P-256 point will do.
+        let p256dh = VapidKeys::generate().unwrap().public_key();
+        let auth = "AAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        let notifier = Notifier::new(keys, &config());
+        let subs = [
+            // Bad browser key: fails before any network I/O.
+            Subscription {
+                endpoint: "https://push.invalid/a".into(),
+                p256dh: "!!".into(),
+                auth: auth.clone(),
+            },
+            // Unparsable endpoint: fails before any network I/O.
+            Subscription { endpoint: "not a url".into(), p256dh, auth },
+        ];
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let message = msg(ALICE, MessageKind::Claimable);
+        let report = rt.block_on(notifier.send(&message, &subs));
+        assert_eq!(report, SendReport { delivered: 0, failed: 2, gone: vec![] });
+        assert_eq!(rt.block_on(notifier.send(&message, &[])), SendReport::default());
+
+        // How push-service answers are counted.
+        // `ErrorInfo` is not re-exported by web-push; build it by inference.
+        let info = |code: u16| {
+            serde_json::from_value(serde_json::json!({
+                "code": code, "errno": 0, "error": "", "message": ""
+            }))
+            .unwrap()
+        };
+        let mut r = SendReport::default();
+        tally(&mut r, "https://p/ok", Ok(()));
+        tally(&mut r, "https://p/410", Err(web_push::WebPushError::EndpointNotValid(info(410))));
+        tally(&mut r, "https://p/404", Err(web_push::WebPushError::EndpointNotFound(info(404))));
+        tally(&mut r, "https://p/500", Err(web_push::WebPushError::Unspecified));
+        assert_eq!(
+            r,
+            SendReport {
+                delivered: 1,
+                failed: 1,
+                gone: vec!["https://p/410".into(), "https://p/404".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn notify_debug_hides_secrets() {
+        let sub = Subscription {
+            endpoint: "https://push.example/ep".into(),
+            p256dh: "P256DH-SECRET".into(),
+            auth: "AUTH-SECRET".into(),
+        };
+        let s = format!("{sub:?}");
+        assert!(s.contains("https://push.example/ep"), "{s}");
+        assert!(!s.contains("P256DH-SECRET") && !s.contains("AUTH-SECRET"), "{s}");
+
+        let keys = VapidKeys::generate().unwrap();
+        let private = keys.private_b64.clone();
+        let s = format!("{keys:?} {keys:#?}");
+        assert!(!s.contains(&private), "{s}");
+        let s = format!("{:?}", Notifier::new(keys, &config()));
+        assert!(!s.contains(&private), "{s}");
+        assert!(s.contains("https://atomanja.example"), "{s}");
+
+        let err = NotifyError::Key("bad length".into());
+        assert!(err.to_string().contains("bad length"));
+        assert!(std::error::Error::source(&err).is_none());
+        let io = NotifyError::Io(std::io::Error::other("disk"));
+        assert!(std::error::Error::source(&io).is_some());
+    }
 
     // notify-03
     #[test] fn app_38_notification_default_french() { todo!() }
