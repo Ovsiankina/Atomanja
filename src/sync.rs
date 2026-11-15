@@ -250,14 +250,19 @@ pub enum SyncError {
 
 impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        match self {
+            SyncError::Fetch(e) => write!(f, "fetch failed, nothing changed: {e}"),
+            SyncError::Store(e) => write!(f, "store failed, nothing written: {e}"),
+        }
     }
 }
 
 impl std::error::Error for SyncError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        todo!()
+        match self {
+            SyncError::Fetch(e) => Some(e),
+            SyncError::Store(e) => Some(e),
+        }
     }
 }
 
@@ -268,7 +273,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::{Push, poll_once, run};
+    use super::{Push, SyncError, poll_once, run};
     use crate::auth::{AccountId, PasswordHash, Role};
     use crate::ledger::{Change, Outcome, TaskId, Timestamp};
     use crate::notify::{Message, MessageKind, SendReport, Subscription};
@@ -335,7 +340,7 @@ mod tests {
             self.sent
                 .lock()
                 .unwrap()
-                .push((message.clone(), subscriptions.to_vec()));
+                .push((*message, subscriptions.to_vec()));
             let gone: Vec<String> = subscriptions
                 .iter()
                 .map(|s| s.endpoint.clone())
@@ -532,7 +537,7 @@ mod tests {
         let ran = block_on(async {
             tokio::time::timeout(
                 Duration::from_millis(300),
-                run(&source, &store, &titles, &push, Duration::from_secs(3600)),
+                run(&source, &store, &titles, &push, Duration::from_hours(1)),
             )
             .await
         });
@@ -570,10 +575,109 @@ mod tests {
     // sync-02
     #[test]
     fn sync_failed_fetch_changes_nothing() {
-        todo!()
+        // Either list failing fails the whole poll, including a failure
+        // after the task pages already arrived (Review Focus 2).
+        for broken in [Resource::Tasks, Resource::Projects] {
+            let (store, worker, witness) = fresh();
+            let push = FakePush::default();
+            let titles = titles();
+            let ok = FakeSource::open();
+            block_on(poll_once(&ok, &store, &titles, &push, Timestamp(DUE - 60))).unwrap();
+            let before = changes(&store);
+            *titles.lock().unwrap() = BTreeMap::from([(TaskId(1), "old".to_owned())]);
+
+            // The deadline has passed, but Vikunja is unreachable.
+            let source = FakeSource {
+                fail: Some(broken),
+                ..FakeSource::open()
+            };
+            let err = block_on(poll_once(
+                &source,
+                &store,
+                &titles,
+                &push,
+                Timestamp(DUE + 60),
+            ))
+            .unwrap_err();
+
+            assert!(
+                matches!(&err, SyncError::Fetch(VikunjaError::Transport(_))),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("connection refused"), "{err}");
+            assert!(std::error::Error::source(&err).is_some());
+            assert_eq!(changes(&store), before, "nothing persisted");
+            assert_eq!(
+                *titles.lock().unwrap(),
+                BTreeMap::from([(TaskId(1), "old".to_owned())]),
+                "titles untouched"
+            );
+            assert!(push.sent.lock().unwrap().is_empty(), "nothing sent");
+            let store = store.lock().unwrap();
+            assert_eq!(store.subscriptions(worker).unwrap().len(), 1);
+            assert_eq!(store.subscriptions(witness).unwrap().len(), 1);
+        }
     }
+
     #[test]
     fn app_9_decisions_deferred_until_successful_poll() {
-        todo!()
+        let (store, _, _) = fresh();
+        let push = FakePush::default();
+        let titles = titles();
+        block_on(poll_once(
+            &FakeSource::open(),
+            &store,
+            &titles,
+            &push,
+            Timestamp(DUE - 600),
+        ))
+        .unwrap();
+
+        // Polls after the deadline fail: no decision yet (SRS 5.1).
+        let down = FakeSource {
+            fail: Some(Resource::Tasks),
+            ..FakeSource::open()
+        };
+        for late in [60, 3600] {
+            let polled = block_on(poll_once(
+                &down,
+                &store,
+                &titles,
+                &push,
+                Timestamp(DUE + late),
+            ));
+            assert!(polled.is_err());
+            assert!(decisions(&store).is_empty());
+        }
+
+        // First successful poll: decided once, from Vikunja's done_at
+        // (done 5 minutes before the deadline: met, APP-9).
+        let done = FakeSource::task(true, "2019-12-31T23:55:00Z");
+        let decided = block_on(poll_once(
+            &done,
+            &store,
+            &titles,
+            &push,
+            Timestamp(DUE + 7200),
+        ))
+        .unwrap();
+        assert!(decided.contains(&Change::Decided {
+            occurrence: crate::ledger::OccurrenceId(0),
+            outcome: Outcome::Met,
+            at: Timestamp(DUE + 7200),
+        }));
+        assert_eq!(decisions(&store), [Outcome::Met]);
+
+        // And never again (APP-10).
+        let again = block_on(poll_once(
+            &done,
+            &store,
+            &titles,
+            &push,
+            Timestamp(DUE + 9000),
+        ))
+        .unwrap();
+        assert!(again.is_empty());
+        assert_eq!(decisions(&store), [Outcome::Met]);
     }
 }
