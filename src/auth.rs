@@ -30,7 +30,7 @@ impl Role {
     /// `true` only for [`Role::Witness`]. The admin is never a real
     /// witness (APP-20).
     pub fn is_real_witness(self) -> bool {
-        todo!()
+        self == Role::Witness
     }
 
     /// Which database this role's requests use (APP-30, DEV-3).
@@ -187,8 +187,11 @@ pub fn permits(actor: &Account, action: Action) -> bool {
 ///
 /// `WorkerExists`.
 pub fn may_create_worker(existing: &[Role]) -> Result<(), AuthError> {
-    let _ = existing;
-    todo!()
+    if existing.contains(&Role::Worker) {
+        Err(AuthError::WorkerExists)
+    } else {
+        Ok(())
+    }
 }
 
 /// Why an auth operation failed.
@@ -231,9 +234,25 @@ impl std::error::Error for AuthError {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     // auth-01
-    #[test] fn app_20_admin_is_not_real_witness() { todo!() }
-    #[test] fn app_25_exactly_one_worker_allowed() { todo!() }
+    #[test]
+    fn app_20_admin_is_not_real_witness() {
+        assert!(!Role::Admin.is_real_witness());
+        assert!(!Role::Worker.is_real_witness());
+        assert!(Role::Witness.is_real_witness());
+    }
+
+    #[test]
+    fn app_25_exactly_one_worker_allowed() {
+        assert_eq!(may_create_worker(&[]), Ok(()));
+        assert_eq!(may_create_worker(&[Role::Witness, Role::Admin]), Ok(()));
+        assert_eq!(
+            may_create_worker(&[Role::Witness, Role::Worker]),
+            Err(AuthError::WorkerExists)
+        );
+    }
 
     // auth-02
     #[test] fn app_27_password_hash_verifies_only_same_password() { todo!() }
