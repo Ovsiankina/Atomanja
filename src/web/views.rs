@@ -165,7 +165,7 @@ pub(super) fn row(ctx: &Ctx<'_>, ledger: &Ledger, o: usize, d: Option<usize>, er
     html! {
         li class={ "at-row at-row--" (st.class()) } id={ "occ-" (o) } {
             div.at-row__when {
-                span.at-mono { (m.date(deadline)) }
+                span.at-mono { (m.deadline(deadline)) }
                 @if ctx.titles.is_some() { span.at-index { "#" (task.0) } }
             }
             div.at-row__main {
@@ -409,7 +409,7 @@ fn table(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
                             @if worker {
                                 td.at-table__title { (label(ctx, i.task)) (events_of(m, ledger, i.o)) }
                             }
-                            td.at-mono { (m.date(i.deadline)) }
+                            td.at-mono { (m.deadline(i.deadline)) }
                             td { (pages::tag(i.st.class(), i.st.word(m))) }
                             @if let Some(d) = i.d {
                                 td.at-mono { (money(m, ledger, d)) }
@@ -458,7 +458,7 @@ fn kanban(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
                     @for i in col {
                         article.at-card id={ "occ-" (i.o) } {
                             div.at-card__top {
-                                span.at-mono { (m.date(i.deadline)) }
+                                span.at-mono { (m.deadline(i.deadline)) }
                                 @if let Some(d) = i.d { span.at-mono { (money(m, ledger, d)) } }
                             }
                             div.at-card__title { (label(ctx, i.task)) }
@@ -565,8 +565,8 @@ fn gantt(ctx: &Ctx<'_>, ledger: &Ledger, items: &[Item]) -> Markup {
                     @let moved = moved_to(ledger, i.o).map(|t| fx(day(t)) + 0.5);
                     @let over = i.st == Status::Late && now > d + 1.0;
                     @let note = match (i.st, i.d) {
-                        (Status::Upcoming, _) => m.date(i.deadline),
-                        (Status::Done, _) => format!("{} · {}", i.st.word(m), m.date(i.deadline)),
+                        (Status::Upcoming, _) => m.deadline(i.deadline),
+                        (Status::Done, _) => format!("{} · {}", i.st.word(m), m.deadline(i.deadline)),
                         (_, Some(dd)) => format!("{} · {}", i.st.word(m), money(m, ledger, dd)),
                         (st, None) => st.word(m).to_owned(),
                     };

@@ -404,8 +404,8 @@ impl Msgs {
     /// `Locked deadline 14 Nov` (the Gantt's lock tick).
     pub fn locked(&self, at: Timestamp) -> String {
         match self.lang {
-            Lang::Fr => format!("Échéance verrouillée {}", self.date(at)),
-            Lang::En => format!("Locked deadline {}", self.date(at)),
+            Lang::Fr => format!("Échéance verrouillée {}", self.deadline(at)),
+            Lang::En => format!("Locked deadline {}", self.deadline(at)),
         }
     }
 
@@ -487,12 +487,26 @@ impl Msgs {
         }
     }
 
-    /// `14 Nov` / `14 nov.`, UTC (SRS 5.1).
+    /// `14 Nov` / `14 nov.`, Swiss local day (SRS 5.1).
     pub fn date(&self, at: Timestamp) -> String {
-        match time::OffsetDateTime::from_unix_timestamp(at.0) {
-            Ok(t) => format!("{} {}", t.day(), self.months[usize::from(u8::from(t.month())) - 1]),
+        match swiss(at) {
+            Some(t) => format!("{} {}", t.day(), self.months[usize::from(u8::from(t.month())) - 1]),
             // DECISION: an out-of-range stored time prints as `?`, never panics.
-            Err(_) => "?".to_owned(),
+            None => "?".to_owned(),
+        }
+    }
+
+    /// A deadline with its time of day: `14 nov. · 20h00` / `14 Nov · 20:00`.
+    pub fn deadline(&self, at: Timestamp) -> String {
+        match swiss(at) {
+            Some(t) => {
+                let sep = match self.lang {
+                    Lang::Fr => 'h',
+                    Lang::En => ':',
+                };
+                format!("{} · {:02}{sep}{:02}", self.date(at), t.hour(), t.minute())
+            }
+            None => "?".to_owned(),
         }
     }
 
@@ -509,5 +523,35 @@ impl Msgs {
     /// `10 CHF`: number then currency.
     pub fn amount(&self, amount: Centimes) -> String {
         format!("{} CHF", self.number(amount))
+    }
+}
+
+// DECISION: deadlines show in Swiss time (CET, CEST in summer) with the EU
+// rule hand-rolled (last Sunday of March/October, 01:00 UTC), so no `tz`
+// crate or `time` feature is needed. All users are in Switzerland.
+/// `at` in Europe/Zurich local time, or `None` when out of range.
+fn swiss(at: Timestamp) -> Option<time::OffsetDateTime> {
+    let utc = time::OffsetDateTime::from_unix_timestamp(at.0).ok()?;
+    let switch = |month: time::Month| -> Option<time::OffsetDateTime> {
+        let last = time::Date::from_calendar_date(utc.year(), month, 31).ok()?;
+        let back = i64::from(last.weekday().number_days_from_sunday());
+        let sunday = last.checked_sub(time::Duration::days(back))?;
+        Some(sunday.with_hms(1, 0, 0).ok()?.assume_utc())
+    };
+    let summer = utc >= switch(time::Month::March)? && utc < switch(time::Month::October)?;
+    let hours = if summer { 2 } else { 1 };
+    Some(utc.to_offset(time::UtcOffset::from_hms(hours, 0, 0).ok()?))
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{msgs, Lang, Timestamp};
+
+    #[test]
+    fn deadline_shows_swiss_time() {
+        // 2026-11-14 19:00 UTC = 20h00 CET.
+        assert_eq!(msgs(Lang::Fr).deadline(Timestamp(1_794_682_800)), "14 nov. · 20h00");
+        // 2026-07-01 18:00 UTC = 20:00 CEST.
+        assert!(msgs(Lang::En).deadline(Timestamp(1_782_928_800)).ends_with("· 20:00"));
     }
 }
