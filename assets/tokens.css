@@ -1,0 +1,46 @@
+/* Atomanja, generated from tokens.json */
+:root, [data-theme="dark"] {
+  --bg: #1f1f1f;
+  --surface: #292929;
+  --surface-sunken: #171717;
+  --line: #3b3b3b;
+  --line-strong: #757575;
+  --ink: #dbdbdb;
+  --ink-muted: #999999;
+  --accent: #a89af5;
+  --late: #f08a3c;
+  --confirmed: #7cc4f0;
+  --on-fill: #171717;
+}
+[data-theme="light"] {
+  --bg: #e9e6df;
+  --surface: #f4f2ed;
+  --surface-sunken: #dedad2;
+  --line: #c9c5bc;
+  --line-strong: #7d7a73;
+  --ink: #1c1f22;
+  --ink-muted: #5d5b56;
+  --accent: #5a43c9;
+  --late: #a34300;
+  --confirmed: #0f6aa8;
+  --on-fill: #f4f2ed;
+}
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --space-20: 80px;
+  --radius-none: 0px;
+  --radius-pill: 999px;
+  --hairline: 1px;
+  --row: 44px;
+  --control: 40px;
+  --control-sm: 32px;
+  --day: 28px;
+  --font-sans: "Hanken Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
