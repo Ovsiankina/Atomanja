@@ -34,6 +34,9 @@ pub struct Task {
     /// `0001-01-01T00:00:00Z` sentinel maps to `None`, never to a past
     /// date (APP-3, Review Focus 1).
     pub due: Option<OffsetDateTime>,
+    /// Vikunja's `start_date` in UTC; `None` for the zero sentinel. Only
+    /// the Gantt view reads it (start of the bar).
+    pub start: Option<OffsetDateTime>,
     /// Vikunja's `done_at` in UTC; `None` for the zero sentinel (APP-8).
     pub done_at: Option<OffsetDateTime>,
     /// Vikunja task id, the task number `#<id>`.
@@ -135,6 +138,8 @@ struct RawTask {
     #[serde(default)]
     done: bool,
     due_date: Option<String>,
+    #[serde(default)]
+    start_date: Option<String>,
     done_at: Option<String>,
     #[serde(default)]
     repeat_after: i64,
@@ -146,6 +151,7 @@ impl RawTask {
     fn into_task(self) -> Result<Task, VikunjaError> {
         Ok(Task {
             due: parse_date(self.due_date.as_deref())?,
+            start: parse_date(self.start_date.as_deref())?,
             done_at: parse_date(self.done_at.as_deref())?,
             title: self.title,
             id: self.id,
@@ -410,6 +416,15 @@ mod tests {
         let mut tasks = parse_tasks(json).expect("fixture parses");
         assert_eq!(tasks.len(), 1);
         tasks.remove(0)
+    }
+
+    #[test]
+    fn start_date_parsed_and_zero_is_none() {
+        assert_eq!(one(&task_json("")).start, None);
+        let zero = one(&task_json(r#","start_date":"0001-01-01T00:00:00Z""#));
+        assert_eq!(zero.start, None);
+        let set = one(&task_json(r#","start_date":"2026-11-20T09:00:00+01:00""#));
+        assert_eq!(set.start, Some(utc(2026, 11, 20, 8, 0)));
     }
 
     // vikunja-02

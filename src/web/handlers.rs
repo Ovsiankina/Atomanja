@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use axum::extract::{Form, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use maud::Markup;
 use serde::Deserialize;
@@ -11,11 +11,11 @@ use serde::Deserialize;
 use super::i18n::{msgs, Msgs};
 use super::pages::{self, AuthCard, Field, Nav};
 use super::session::{self, internal, lock, see_other, Actor};
-use super::views::{self, Ctx, Viewer};
+use super::views::{self, Ctx, View, Viewer};
 use super::AppState;
 use crate::auth::{self, Account, Database, Role};
 use crate::config::Lang;
-use crate::ledger::TaskId;
+use crate::ledger::{TaskId, Timestamp};
 use crate::store::{Kind, Store, StoreError};
 
 /// The signed-in actor, or the response to send instead (redirect to
@@ -45,25 +45,67 @@ pub(super) async fn not_found() -> Response {
     (StatusCode::NOT_FOUND, public_page(m.err_not_found, &card)).into_response()
 }
 
+/// Name of the cookie remembering the last task view.
+const VIEW_COOKIE: &str = "atomanja_view";
+
+/// `?view=gantt|list|table|kanban`.
+#[derive(Deserialize)]
+pub(super) struct IndexQuery {
+    view: Option<String>,
+}
+
+/// The view remembered in the `atomanja_view` cookie, if any.
+pub(super) fn remembered_view(headers: &HeaderMap) -> Option<View> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == VIEW_COOKIE).then(|| View::parse(value)).flatten()
+        })
+}
+
+// DECISION: the view comes from `?view=`, else the cookie, else Gantt
+// (the design system's default). A `?view=` choice is remembered for a
+// year in a plain cookie: it is a display preference, not a secret.
 /// `GET /`: the worker view or the witness view, from the one file the
-/// account's role reads (DEV-3).
-pub(super) async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// account's role reads (DEV-3), in the chosen task view.
+pub(super) async fn index(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<IndexQuery>,
+    headers: HeaderMap,
+) -> Response {
     let actor = match require(&state, &headers) {
         Ok(a) => a,
         Err(r) => return *r,
     };
     let m = msgs(actor.account.lang);
+    let chosen = q.view.as_deref().and_then(View::parse);
+    let view = chosen.or_else(|| remembered_view(&headers)).unwrap_or(View::Gantt);
     // Titles are copied before any store lock (never two locks at once),
     // and only for the worker: the witness view never reads them (APP-32).
     let titles = (actor.account.role == Role::Worker).then(|| lock(&state.titles).clone());
-    let body = match actor.account.role.database() {
-        Database::Ledger => dashboard_from(&*lock(&state.ledger), &actor.account, titles.as_ref()),
-        Database::Dev => dashboard_from(&*lock(&state.dev), &actor.account, None),
+    let starts = match actor.account.role.database() {
+        Database::Ledger => lock(&state.starts).clone(),
+        Database::Dev => BTreeMap::new(),
     };
-    match body {
+    let body = match actor.account.role.database() {
+        Database::Ledger => dashboard_from(&*lock(&state.ledger), &actor.account, titles.as_ref(), &starts, view),
+        Database::Dev => dashboard_from(&*lock(&state.dev), &actor.account, None, &starts, view),
+    };
+    let mut r = match body {
         Ok(b) => page(m, m.nav_tasks, "tasks", &b),
-        Err(e) => internal(&e),
+        Err(e) => return internal(&e),
+    };
+    if let Some(v) = chosen {
+        let cookie = format!("{VIEW_COOKIE}={}; Path=/; Max-Age=31536000; SameSite=Lax", v.key());
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            r.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
+    r
 }
 
 /// The dashboard of `account` over `store`.
@@ -71,6 +113,8 @@ fn dashboard_from<K: Kind>(
     store: &Store<K>,
     account: &Account,
     titles: Option<&BTreeMap<TaskId, String>>,
+    starts: &BTreeMap<TaskId, Timestamp>,
+    view: View,
 ) -> Result<Markup, StoreError> {
     let ledger = store.load_ledger()?;
     let ctx = Ctx {
@@ -78,8 +122,10 @@ fn dashboard_from<K: Kind>(
         viewer: Viewer::of(account),
         titles,
         names: Ctx::names_of(&store.accounts()?),
+        starts,
+        today: session::stamp(),
     };
-    Ok(views::dashboard(&ctx, &ledger, None))
+    Ok(views::dashboard(&ctx, &ledger, view, None))
 }
 
 /// The login form, with an optional error or notice.

@@ -43,7 +43,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
-use crate::ledger::TaskId;
+use crate::ledger::{TaskId, Timestamp};
 use crate::mail::Mailer;
 use crate::notify::Notifier;
 use crate::store::{DevDb, LedgerDb, Store};
@@ -75,6 +75,11 @@ pub struct AppState {
     /// Task titles from the last successful poll, filled by `sync`. Read
     /// only by the worker view (APP-31); never by the witness view (APP-32).
     pub titles: Arc<Mutex<BTreeMap<TaskId, String>>>,
+    /// Vikunja start dates from the last successful poll, filled by
+    /// `sync`; only tasks that have one. Read by the Gantt view to draw
+    /// the bar from start to deadline; carries no title, so the witness
+    /// view may read it.
+    pub starts: Arc<Mutex<BTreeMap<TaskId, Timestamp>>>,
     /// Push sender for notifications caused by web actions (APP-35, APP-36).
     pub notifier: Arc<Notifier>,
     /// SMTP sender for invite and reset emails (APP-26, APP-28).
@@ -189,13 +194,13 @@ mod tests {
         assert_eq!(stored.kind, TokenKind::Session);
         assert_eq!(stored.account, Some(worker.id));
 
-        let page = h.get("/", Some(&cookie)).await;
+        let page = h.get("/?view=list", Some(&cookie)).await;
         assert_eq!(page.status, 200);
         assert!(page.body.contains(r#"data-view="worker""#), "{}", page.body);
 
         let out = h.post("/logout", Some(&cookie), &[]).await;
         assert_eq!(out.status, 303);
-        let after = h.get("/", Some(&cookie)).await;
+        let after = h.get("/?view=list", Some(&cookie)).await;
         assert_eq!(after.status, 303, "logged-out session no longer works");
         assert_eq!(after.location(), Some("/login"));
     }
@@ -215,10 +220,10 @@ mod tests {
             assert!(r.session_cookie().is_none());
             assert!(r.body.contains("Adresse ou mot de passe incorrect"), "{}", r.body);
         }
-        let anon = h.get("/", None).await;
+        let anon = h.get("/?view=list", None).await;
         assert_eq!(anon.status, 303);
         assert_eq!(anon.location(), Some("/login"));
-        let forged = h.get("/", Some("forged-token")).await;
+        let forged = h.get("/?view=list", Some("forged-token")).await;
         assert_eq!(forged.status, 303);
     }
 
@@ -245,7 +250,7 @@ mod tests {
         assert!(h.dev(|s| s.token(&Token(cookie.clone())).unwrap()).is_some());
         assert!(h.ledger(|s| s.token(&Token(cookie.clone())).unwrap()).is_none());
 
-        let page = h.get("/", Some(&cookie)).await;
+        let page = h.get("/?view=list", Some(&cookie)).await;
         assert_eq!(page.status, 200);
         assert!(page.body.contains(r#"data-view="witness""#), "{}", page.body);
         assert!(page.body.contains("Tâche 901"), "{}", page.body);
@@ -268,7 +273,7 @@ mod tests {
 
         // The worker sees the ledger, never the dev data.
         let wc = h.ledger(|s| testkit::session(s, &worker));
-        let wp = h.get("/", Some(&wc)).await;
+        let wp = h.get("/?view=list", Some(&wc)).await;
         assert!(wp.body.contains("Real secret title"), "{}", wp.body);
         assert!(!wp.body.contains("901"));
     }
@@ -355,7 +360,7 @@ mod tests {
         assert_eq!(account.role, Role::Witness);
         assert!(crate::auth::verify_password(&account.password_hash, "witness pass"));
         assert!(h.ledger(|s| s.token(&Token(secret.clone())).unwrap()).unwrap().used);
-        let view = h.get("/", Some(&cookie)).await;
+        let view = h.get("/?view=list", Some(&cookie)).await;
         assert!(view.body.contains(r#"data-view="witness""#));
 
         // Single use: the same link never creates a second account.
@@ -508,7 +513,7 @@ mod tests {
         let h = Harness::start().await;
         let p = rich_ledger(&h);
         let cookie = h.ledger(|s| testkit::session(s, &p.worker));
-        let page = h.get("/", Some(&cookie)).await;
+        let page = h.get("/?view=list", Some(&cookie)).await;
         assert_eq!(page.status, 200);
         let body = &page.body;
         assert!(body.contains(r#"data-view="worker""#));
@@ -555,14 +560,15 @@ mod tests {
         let p = rich_ledger(&h);
         let ca = h.ledger(|s| testkit::session(s, &p.a));
         let cb = h.ledger(|s| testkit::session(s, &p.b));
-        for (cookie, path) in [(&ca, "/"), (&ca, "/settings"), (&cb, "/"), (&cb, "/settings")] {
+        let paths = ["/", "/?view=gantt", "/?view=list", "/?view=table", "/?view=kanban", "/settings"];
+        for (cookie, path) in [&ca, &cb].into_iter().flat_map(|c| paths.map(|p| (c, p))) {
             let page = h.get(path, Some(cookie)).await;
             assert_eq!(page.status, 200, "{path}");
             for title in TITLES {
                 assert!(!page.body.contains(title), "{path} leaks {title:?}: {}", page.body);
             }
         }
-        let page = h.get("/", Some(&ca)).await.body;
+        let page = h.get("/?view=list", Some(&ca)).await.body;
         assert!(page.contains(r#"data-view="witness""#));
         for n in 47..=52 {
             assert!(page.contains(&format!("Tâche {n}")), "task number only: Tâche {n}");
@@ -576,9 +582,80 @@ mod tests {
         assert!(page.contains(r#"action="/debts/2/claim""#), "unclaimed #49 claimable");
         assert!(page.contains(r#"action="/debts/1/received""#), "owner marks #48 received");
         assert!(!page.contains("/sent\""), "witnesses never mark sent");
-        let other = h.get("/", Some(&cb)).await.body;
+        let other = h.get("/?view=list", Some(&cb)).await.body;
         assert!(other.contains(r#"action="/debts/2/claim""#));
         assert!(!other.contains("/received\""), "only the owner marks received");
+    }
+
+    #[tokio::test]
+    async fn task_views_gantt_list_table_kanban() {
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let cw = h.ledger(|s| testkit::session(s, &p.worker));
+        // Default: the Gantt (design system `TaskViews` default), no cookie set.
+        let first = h.get("/", Some(&cw)).await;
+        assert!(first.body.contains(r#"data-layout="gantt""#), "{}", first.body);
+        assert!(first.headers.get("set-cookie").is_none());
+        for (key, marker) in [
+            ("gantt", "at-gantt__row--late"),
+            ("list", r#"class="at-list""#),
+            ("table", r#"class="at-table""#),
+            ("kanban", r#"class="at-kanban""#),
+        ] {
+            let r = h.get(&format!("/?view={key}"), Some(&cw)).await;
+            assert_eq!(r.status, 200);
+            assert!(r.body.contains(marker), "{key}: {}", r.body);
+            assert!(r.body.contains(&format!(r#"data-layout="{key}""#)));
+            assert!(r.body.contains("Pay rent"), "{key} shows titles to the worker");
+            // The switch links all four views and marks this one.
+            for v in ["gantt", "list", "table", "kanban"] {
+                assert!(r.body.contains(&format!(r#"href="/?view={v}""#)), "{key} links {v}");
+            }
+            assert!(r.body.contains(r#"aria-current="page""#));
+            let set = r.headers.get("set-cookie").unwrap().to_str().unwrap();
+            assert!(set.starts_with(&format!("atomanja_view={key};")), "{set}");
+        }
+        // The cookie reopens the last view.
+        let again = h.get("/", Some(&format!("{cw}; atomanja_view=kanban"))).await;
+        assert!(again.body.contains(r#"data-layout="kanban""#));
+        // An unknown view falls back to the Gantt.
+        let bad = h.get("/?view=nope", Some(&cw)).await;
+        assert!(bad.body.contains(r#"data-layout="gantt""#));
+        // Table and board actions are plain form posts (no in-place swap).
+        for key in ["table", "kanban"] {
+            let body = h.get(&format!("/?view={key}"), Some(&cw)).await.body;
+            assert!(body.contains(r#"<form method="post" action="/debts/3/sent">"#), "{key}: {body}");
+        }
+        // Kanban: the four design-system columns plus met.
+        let board = h.get("/?view=kanban", Some(&cw)).await.body;
+        for col in ["at-col--upcoming", "at-col--late", "at-col--sent", "at-col--received", "at-col--met"] {
+            assert!(board.contains(col), "{col}");
+        }
+        // Table: No., Task, Deadline… headers for the worker.
+        let table = h.get("/?view=table", Some(&cw)).await.body;
+        assert!(table.contains(">Tâche<") && table.contains(">Échéance<"));
+    }
+
+    #[tokio::test]
+    async fn gantt_bar_starts_at_vikunja_start_date() {
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let cw = h.ledger(|s| testkit::session(s, &p.worker));
+        let one_day = h.get("/?view=gantt", Some(&cw)).await.body;
+        // Three days before task 49's deadline (late, so always in range).
+        h.start_date(49, testkit::DEADLINE - 3 * 86_400);
+        let spanned = h.get("/?view=gantt", Some(&cw)).await.body;
+        let bar = |body: &str| {
+            let row = &body[body.find("Call dentist").unwrap()..];
+            let bar = &row[row.find("at-gantt__bar").unwrap()..];
+            bar[..bar.find("\"></i>").unwrap()].to_owned()
+        };
+        assert_ne!(bar(&one_day), bar(&spanned), "the start date widens the bar");
+        // A witness gets the bars but never the title.
+        let ca = h.ledger(|s| testkit::session(s, &p.a));
+        let witness = h.get("/?view=gantt", Some(&ca)).await.body;
+        assert!(witness.contains("at-gantt__bar") && !witness.contains("Call dentist"));
+        assert!(witness.contains("N° de tâche"));
     }
 
     // web-06
@@ -690,7 +767,7 @@ mod tests {
 
         // APP-24: both the worker and the owner witness see both marks.
         for cookie in [&cw, &ca] {
-            let page = h.get("/", Some(cookie)).await.body;
+            let page = h.get("/?view=list", Some(cookie)).await.body;
             let row = &page[page.find(r#"id="occ-1""#).unwrap()..];
             let row = &row[..row.find("</li>").unwrap()];
             assert_eq!(row.matches("at-check is-on").count(), 2, "{row}");
@@ -833,7 +910,7 @@ mod tests {
             assert!(page.contains("Se déconnecter"), "{path}");
             assert!(!page.contains("Sign out"), "{path}");
         }
-        let view = h.get("/", Some(&cw)).await.body;
+        let view = h.get("/?view=list", Some(&cw)).await.body;
         assert!(view.contains("Dû") && view.contains("Marquer envoyé") && view.contains("En retard"));
         assert!(!view.contains("Owed") && !view.contains("Mark sent"));
         let hx = h.hx_post("/debts/2/claim", Some(&ca), &[]).await.body;
@@ -854,7 +931,7 @@ mod tests {
         assert_eq!(en.status, 303);
         assert_eq!(en.location(), Some("/settings"));
         assert_eq!(h.ledger(|s| s.account(p.worker.id).unwrap()).unwrap().lang, Lang::En);
-        let view = h.get("/", Some(&cw)).await.body;
+        let view = h.get("/?view=list", Some(&cw)).await.body;
         assert!(view.contains(r#"<html lang="en""#));
         for word in ["Sign out", "Owed", "Mark sent", "Late", "Claimed by a@witness.test", "14 Nov"] {
             assert!(view.contains(word), "English view has {word}");
@@ -864,13 +941,13 @@ mod tests {
         assert!(back_label.contains("Français"));
         // Other accounts keep their own language.
         let ca = h.ledger(|s| testkit::session(s, &p.a));
-        assert!(h.get("/", Some(&ca)).await.body.contains(r#"<html lang="fr""#));
+        assert!(h.get("/?view=list", Some(&ca)).await.body.contains(r#"<html lang="fr""#));
 
         assert_eq!(h.post("/lang", Some(&cw), &[("lang", "de")]).await.status, 400);
         let fr = h.post("/lang", Some(&cw), &[("lang", "fr")]).await;
         assert_eq!(fr.status, 303);
         assert_eq!(h.ledger(|s| s.account(p.worker.id).unwrap()).unwrap().lang, Lang::Fr);
-        assert!(h.get("/", Some(&cw)).await.body.contains("Se déconnecter"));
+        assert!(h.get("/?view=list", Some(&cw)).await.body.contains("Se déconnecter"));
         assert_eq!(h.post("/lang", None, &[("lang", "en")]).await.status, 303, "anonymous: to login");
     }
 

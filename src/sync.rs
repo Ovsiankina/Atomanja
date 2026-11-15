@@ -159,7 +159,8 @@ fn apply(
 ///    run `Ledger::observe` with the store's real witnesses, append the
 ///    changes in one transaction ([`Store::append`]), and collect the
 ///    `notify::messages` for them with each recipient's subscriptions;
-/// 3. replace the contents of `titles` with every fetched task's title;
+/// 3. replace the contents of `titles` with every fetched task's title,
+///    and of `starts` with every Vikunja start date that is set;
 /// 4. after releasing the lock, send each message through `push` and
 ///    remove the subscriptions the report lists as gone.
 ///
@@ -177,10 +178,14 @@ fn apply(
 /// [`Store::load_ledger`]: crate::store::Store::load_ledger
 /// [`Store::append`]: crate::store::Store::append
 /// [`fetch_all`]: crate::vikunja::fetch_all
+// DECISION: titles and starts stay two plain maps (web reads them
+// separately; only titles are worker-only), hence six arguments.
+#[allow(clippy::too_many_arguments)]
 pub async fn poll_once<S, P>(
     source: &S,
     store: &Mutex<Store<LedgerDb>>,
     titles: &Mutex<BTreeMap<TaskId, String>>,
+    starts: &Mutex<BTreeMap<TaskId, Timestamp>>,
     push: &P,
     now: Timestamp,
 ) -> Result<Vec<Change>, SyncError>
@@ -193,6 +198,10 @@ where
         let mut store = lock(store);
         apply(&mut store, &tasks, now).map_err(SyncError::Store)?
     };
+    *lock(starts) = tasks
+        .iter()
+        .filter_map(|t| t.start.map(|s| (TaskId(t.id), timestamp(s))))
+        .collect();
     *lock(titles) = tasks.into_iter().map(|t| (TaskId(t.id), t.title)).collect();
     let mut gone = Vec::new();
     for (message, subscriptions) in &outbox {
@@ -215,10 +224,14 @@ where
 /// every `interval` (`config.poll_interval`), each at the current UTC
 /// time. A failed poll is logged to stderr and the loop waits for the
 /// next tick (SRS 5.1). Never returns.
+// DECISION: titles and starts stay two plain maps (web reads them
+// separately; only titles are worker-only), hence six arguments.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<S, P>(
     source: &S,
     store: &Mutex<Store<LedgerDb>>,
     titles: &Mutex<BTreeMap<TaskId, String>>,
+    starts: &Mutex<BTreeMap<TaskId, Timestamp>>,
     push: &P,
     interval: Duration,
 ) where
@@ -233,7 +246,7 @@ pub async fn run<S, P>(
         // The first tick completes at once: the startup poll (DB-3).
         ticks.tick().await;
         let now = timestamp(OffsetDateTime::now_utc());
-        if let Err(e) = poll_once(source, store, titles, push, now).await {
+        if let Err(e) = poll_once(source, store, titles, starts, push, now).await {
             eprintln!("sync: poll failed, retrying next interval: {e}");
         }
     }
@@ -392,6 +405,10 @@ mod tests {
         (Mutex::new(store), worker, witness)
     }
 
+    fn starts() -> Mutex<BTreeMap<TaskId, Timestamp>> {
+        Mutex::new(BTreeMap::new())
+    }
+
     fn titles() -> Mutex<BTreeMap<TaskId, String>> {
         Mutex::new(BTreeMap::new())
     }
@@ -426,6 +443,7 @@ mod tests {
             &source,
             &store,
             &titles,
+            &starts(),
             &push,
             Timestamp(DUE - 60),
         ))
@@ -450,6 +468,7 @@ mod tests {
             &source,
             &store,
             &titles,
+            &starts(),
             &push,
             Timestamp(DUE + 60),
         ))
@@ -524,6 +543,7 @@ mod tests {
                 &source,
                 &store,
                 &titles(),
+                &starts(),
                 &push,
                 Timestamp(DUE - 60),
             ))
@@ -537,7 +557,7 @@ mod tests {
         let ran = block_on(async {
             tokio::time::timeout(
                 Duration::from_millis(300),
-                run(&source, &store, &titles, &push, Duration::from_hours(1)),
+                run(&source, &store, &titles, &starts(), &push, Duration::from_hours(1)),
             )
             .await
         });
@@ -561,6 +581,7 @@ mod tests {
                     &source,
                     &store,
                     &titles(),
+                    &starts(),
                     &push,
                     Duration::from_millis(100),
                 ),
@@ -582,7 +603,7 @@ mod tests {
             let push = FakePush::default();
             let titles = titles();
             let ok = FakeSource::open();
-            block_on(poll_once(&ok, &store, &titles, &push, Timestamp(DUE - 60))).unwrap();
+            block_on(poll_once(&ok, &store, &titles, &starts(), &push, Timestamp(DUE - 60))).unwrap();
             let before = changes(&store);
             *titles.lock().unwrap() = BTreeMap::from([(TaskId(1), "old".to_owned())]);
 
@@ -595,6 +616,7 @@ mod tests {
                 &source,
                 &store,
                 &titles,
+                &starts(),
                 &push,
                 Timestamp(DUE + 60),
             ))
@@ -628,6 +650,7 @@ mod tests {
             &FakeSource::open(),
             &store,
             &titles,
+            &starts(),
             &push,
             Timestamp(DUE - 600),
         ))
@@ -643,6 +666,7 @@ mod tests {
                 &down,
                 &store,
                 &titles,
+                &starts(),
                 &push,
                 Timestamp(DUE + late),
             ));
@@ -657,6 +681,7 @@ mod tests {
             &done,
             &store,
             &titles,
+            &starts(),
             &push,
             Timestamp(DUE + 7200),
         ))
@@ -673,6 +698,7 @@ mod tests {
             &done,
             &store,
             &titles,
+            &starts(),
             &push,
             Timestamp(DUE + 9000),
         ))

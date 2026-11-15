@@ -121,12 +121,14 @@ fn serve(addr: &str) -> Result<(), Failure> {
     let client = vikunja::Client::new(&config).map_err(|e| failed("Vikunja client", e))?;
     let notifier = Arc::new(Notifier::new(keys, &config));
     let titles = Arc::new(Mutex::new(BTreeMap::new()));
+    let starts = Arc::new(Mutex::new(BTreeMap::new()));
     let interval = config.poll_interval;
     let state = AppState {
         config: Arc::new(config),
         ledger: Arc::clone(&ledger),
         dev,
         titles: Arc::clone(&titles),
+        starts: Arc::clone(&starts),
         notifier: Arc::clone(&notifier),
         mailer,
     };
@@ -149,7 +151,7 @@ fn serve(addr: &str) -> Result<(), Failure> {
         // the accept loop; it never returns, so the process lives as long
         // as the web server does.
         tokio::spawn(async move {
-            sync::run(&client, &ledger, &titles, &*notifier, interval).await;
+            sync::run(&client, &ledger, &titles, &starts, &*notifier, interval).await;
         });
         eprintln!("atomanja: listening on http://{addr}");
         web::serve(state, addr).await.map_err(|e| failed("web server", e))

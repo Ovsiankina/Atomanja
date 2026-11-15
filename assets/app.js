@@ -6,6 +6,24 @@
     navigator.serviceWorker.register('/sw.js');
   }
 
+  // Task views (TaskViews README): Gantt on desktop, list on a phone
+  // until the person picks one (the server remembers it in a cookie).
+  var views = document.querySelector('.at-views[data-layout]');
+  if (views && location.pathname === '/' && !/[?&]view=/.test(location.search) &&
+      document.cookie.indexOf('atomanja_view=') < 0 &&
+      window.matchMedia && window.matchMedia('(max-width: 520px)').matches &&
+      views.getAttribute('data-layout') === 'gantt') {
+    location.replace('/?view=list');
+    return;
+  }
+  // The Gantt opens scrolled so today is in view.
+  var gantt = document.querySelector('.at-gantt');
+  var today = gantt && gantt.querySelector('.at-gantt__day.is-today');
+  if (today) {
+    var label = gantt.querySelector('.at-gantt__label');
+    gantt.scrollLeft = Math.max(0, today.offsetLeft - (label ? label.offsetWidth : 0) - 7 * today.offsetWidth);
+  }
+
   var btn = document.getElementById('enable-push');
   if (!btn) return;
   var hint = document.getElementById('push-hint');

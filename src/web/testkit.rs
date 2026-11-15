@@ -91,6 +91,7 @@ impl Harness {
             ledger: Arc::new(Mutex::new(Store::<LedgerDb>::open_in_memory().expect("ledger"))),
             dev: Arc::new(Mutex::new(Store::<DevDb>::open_in_memory().expect("dev"))),
             titles: Arc::new(Mutex::new(BTreeMap::new())),
+            starts: Arc::new(Mutex::new(BTreeMap::new())),
             notifier: Arc::new(notifier),
             mailer,
         };
@@ -178,7 +179,16 @@ impl Harness {
         f(&mut self.state.dev.lock().expect("dev lock"))
     }
 
-    /// Set the title `sync` would have stored for `task`.
+    /// Set the Vikunja start date `sync` would have stored for `task`.
+    pub fn start_date(&self, task: i64, at: i64) {
+        self.state
+            .starts
+            .lock()
+            .expect("starts lock")
+            .insert(TaskId(task), crate::ledger::Timestamp(at));
+    }
+
+        /// Set the title `sync` would have stored for `task`.
     pub fn title(&self, task: i64, title: &str) {
         self.state
             .titles

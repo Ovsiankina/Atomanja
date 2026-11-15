@@ -111,6 +111,20 @@ pub(super) struct Msgs {
     pub link_unknown: &'static str,
     pub back_to_login: &'static str,
     pub a_worker: &'static str,
+    pub view_label: &'static str,
+    pub view_gantt: &'static str,
+    pub view_list: &'static str,
+    pub view_table: &'static str,
+    pub view_kanban: &'static str,
+    pub col_no: &'static str,
+    pub col_task: &'static str,
+    pub col_task_no: &'static str,
+    pub col_deadline: &'static str,
+    pub col_status: &'static str,
+    pub col_amount: &'static str,
+    pub col_claimed: &'static str,
+    pub col_marks: &'static str,
+    pub none: &'static str,
     months: [&'static str; 12],
     decimal: char,
 }
@@ -221,6 +235,20 @@ const EN: Msgs = Msgs {
     link_unknown: "This link is not valid.",
     back_to_login: "Back to sign in",
     a_worker: "The worker",
+    view_label: "View",
+    view_gantt: "Gantt",
+    view_list: "List",
+    view_table: "Table",
+    view_kanban: "Kanban",
+    col_no: "No.",
+    col_task: "Task",
+    col_task_no: "Task no.",
+    col_deadline: "Deadline",
+    col_status: "Status",
+    col_amount: "Amount",
+    col_claimed: "Claimed by",
+    col_marks: "Marks",
+    none: "None",
     months: [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ],
@@ -333,6 +361,20 @@ const FR: Msgs = Msgs {
     link_unknown: "Ce lien n'est pas valide.",
     back_to_login: "Retour à la connexion",
     a_worker: "Le travailleur",
+    view_label: "Vue",
+    view_gantt: "Gantt",
+    view_list: "Liste",
+    view_table: "Tableau",
+    view_kanban: "Kanban",
+    col_no: "N°",
+    col_task: "Tâche",
+    col_task_no: "N° de tâche",
+    col_deadline: "Échéance",
+    col_status: "Statut",
+    col_amount: "Montant",
+    col_claimed: "Réclamée par",
+    col_marks: "Marques",
+    none: "Aucune",
     // DECISION: French dates use the usual short month ("14 nov."); the
     // README's "14 Nov" is the English form.
     months: [
@@ -351,6 +393,19 @@ pub(super) fn msgs(lang: Lang) -> &'static Msgs {
 }
 
 impl Msgs {
+    /// Short month name: `Nov` / `nov.`.
+    pub fn month(&self, month: time::Month) -> &'static str {
+        self.months[usize::from(u8::from(month)) - 1]
+    }
+
+    /// `Locked deadline 14 Nov` (the Gantt's lock tick).
+    pub fn locked(&self, at: Timestamp) -> String {
+        match self.lang {
+            Lang::Fr => format!("Échéance verrouillée {}", self.date(at)),
+            Lang::En => format!("Locked deadline {}", self.date(at)),
+        }
+    }
+
     /// `Task 47` / `Tâche 47`: the only name a witness ever sees (APP-32).
     pub fn task(&self, n: i64) -> String {
         match self.lang {

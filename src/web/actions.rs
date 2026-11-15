@@ -165,6 +165,7 @@ fn debt_action(state: &AppState, headers: &HeaderMap, debt: u32, op: DebtOp) -> 
         return forbidden(m);
     }
     let titles = (actor.account.role == Role::Worker).then(|| lock(&state.titles).clone());
+    let starts = lock(&state.starts).clone();
     let debt = DebtId(debt);
     let outcome = debt_change(&mut lock(&state.ledger), &actor.account, debt, op);
     let Outcome {
@@ -190,6 +191,8 @@ fn debt_action(state: &AppState, headers: &HeaderMap, debt: u32, op: DebtOp) -> 
         viewer: Viewer::of(&actor.account),
         titles: titles.as_ref(),
         names: Ctx::names_of(&accounts),
+        starts: &starts,
+        today: stamp(),
     };
     let status = if error.is_some() {
         StatusCode::CONFLICT
@@ -203,7 +206,7 @@ fn debt_action(state: &AppState, headers: &HeaderMap, debt: u32, op: DebtOp) -> 
         None => see_other("/"),
         Some(e) => {
             let occ = ledger.debts().occurrence[debt.0 as usize].0 as usize;
-            let body = views::dashboard(&ctx, &ledger, Some((occ, e)));
+            let body = views::dashboard(&ctx, &ledger, views::View::List, Some((occ, e)));
             (status, page(m, m.nav_tasks, "tasks", &body)).into_response()
         }
     }
