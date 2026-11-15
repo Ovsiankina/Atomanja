@@ -1,0 +1,27 @@
+/* Atomanja page frame. Components come from bundle.css; this file only
+   lays out the page around them. Every value comes from tokens.css. */
+html,body{margin:0;background:var(--bg)}
+.page{min-height:100vh;padding:var(--space-4)}
+.page--auth{display:grid;place-items:center}
+.page--auth .at-auth{width:100%}
+.page__head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:var(--space-3);padding-bottom:var(--space-4)}
+.page__mark{font:300 40px/1 var(--font-sans);letter-spacing:-.03em;color:var(--ink);text-decoration:none}
+.page__nav{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-4)}
+.page__nav form{margin:0}
+.page__link{font-size:13px;line-height:18px;color:var(--ink-muted);text-decoration:none}
+.page__link:hover,.page__link.is-on{color:var(--ink);text-decoration:underline}
+.page__link:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.page__main{display:grid;gap:var(--space-8);min-width:0}
+.page__stack{display:grid;gap:var(--space-8);min-width:0}
+.page__pinned{position:sticky;top:0;z-index:3;background:var(--bg)}
+.page__section{display:grid;gap:var(--space-4);padding-top:var(--space-3);border-top:var(--hairline) solid var(--line-strong)}
+.page__section-head{display:flex;gap:var(--space-2)}
+.page__form{display:grid;gap:var(--space-3);justify-items:start;width:100%}
+.page__form .at-field{width:100%}
+.page__row{display:flex;flex-wrap:wrap;gap:var(--space-3)}
+.at-row__act form{margin:0}
+.row__error{margin:var(--space-1) 0 0;font-size:13px;line-height:18px;color:var(--late)}
+@media (min-width:900px){
+  .page{padding:var(--space-12)}
+  .page__mark{font-size:56px}
+}

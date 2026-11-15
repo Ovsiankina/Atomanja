@@ -1,0 +1,359 @@
+//! The settings screen: accounts and invite link (APP-26), own email
+//! (APP-29), amount
+//! proposal (APP-16), language (APP-39), notifications (APP-33).
+
+use axum::extract::{Form, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use maud::{html, Markup};
+use serde::Deserialize;
+
+use super::handlers::{page, require};
+use super::i18n::{msgs, Msgs};
+use super::pages::{self, Field, Variant};
+use super::session::{self, internal, lock, see_other};
+use super::{pwa, AppState};
+use crate::auth::{self, Account, Action, Database, Role};
+use crate::config::Lang;
+use crate::ledger::{Ledger, WitnessId};
+use crate::store::{Kind, Store, StoreError};
+
+/// A freshly created invite link and what happened to its email.
+pub(super) struct InviteOutcome {
+    pub link: String,
+    /// `(address, sent)` when the worker entered an address.
+    pub mailed: Option<(String, bool)>,
+}
+
+/// `GET /settings`.
+pub(super) async fn settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let actor = match require(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    render(&state, &actor.account, None, None)
+}
+
+/// The full settings page for `account`, from its role's file (DEV-3).
+/// `amount_error` explains a refused amount action (plain form posts).
+pub(super) fn render(
+    state: &AppState,
+    account: &Account,
+    invite: Option<&InviteOutcome>,
+    amount_error: Option<&str>,
+) -> Response {
+    let m = msgs(account.lang);
+    let push_key = pwa::public_key(state);
+    let body = match account.role.database() {
+        Database::Ledger => body(&*lock(&state.ledger), account, invite, amount_error),
+        Database::Dev => body(&*lock(&state.dev), account, invite, amount_error),
+    };
+    match body {
+        Ok(b) => {
+            let full = html! {
+                (b)
+                (pages::section(3, m.language, &language_switch(m)))
+                (pages::section(4, m.notif_label, &install_steps(m, push_key.as_deref())))
+            };
+            page(m, m.nav_settings, "settings", &full)
+        }
+        Err(e) => internal(&e),
+    }
+}
+
+/// The settings sections over `store`.
+fn body<K: Kind>(
+    store: &Store<K>,
+    account: &Account,
+    invite: Option<&InviteOutcome>,
+    amount_error: Option<&str>,
+) -> Result<Markup, StoreError> {
+    let m = msgs(account.lang);
+    let accounts = store.accounts()?;
+    let ledger = store.load_ledger()?;
+    Ok(html! {
+        div.page__stack data-view="settings" {
+            @if account.role == Role::Admin {
+                div.page__pinned { (pages::banner(true, m.fake_label, m.fake_text)) }
+            }
+            (pages::section(1, m.amount_per_task, &amount_block(m, &ledger, &accounts, account, amount_error)))
+            (pages::section(2, m.accounts, &account_panel(m, &accounts, account, invite, None)))
+        }
+    })
+}
+
+/// One button that switches the account to the other language (APP-39).
+/// Its label is in the language it switches to.
+fn language_switch(m: &Msgs) -> Markup {
+    let other = match m.lang {
+        Lang::Fr => Lang::En,
+        Lang::En => Lang::Fr,
+    };
+    html! {
+        form.page__row method="post" action="/lang" {
+            input type="hidden" name="lang" value=(other.code());
+            (pages::button(m.other_lang_name, Variant::Outline, false, false, None))
+        }
+    }
+}
+
+/// The language form field.
+#[derive(Deserialize)]
+pub(super) struct LangForm {
+    #[serde(default)]
+    lang: String,
+}
+
+/// `POST /lang`: store the account's language, in the file that holds
+/// the account (APP-39, DEV-3).
+pub(super) async fn set_lang(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<LangForm>,
+) -> Response {
+    let actor = match require(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let Some(lang) = Lang::from_code(&f.lang) else {
+        return (StatusCode::BAD_REQUEST, msgs(actor.account.lang).err_state).into_response();
+    };
+    let done = match actor.home {
+        Database::Ledger => lock(&state.ledger).set_lang(actor.account.id, lang),
+        Database::Dev => lock(&state.dev).set_lang(actor.account.id, lang),
+    };
+    match done {
+        Ok(()) => see_other("/settings"),
+        Err(e) => internal(&e),
+    }
+}
+
+/// The email form field.
+#[derive(Deserialize)]
+pub(super) struct EmailForm {
+    #[serde(default)]
+    new_email: String,
+}
+
+/// `POST /email`: the account owner changes their own address, in the
+/// file that holds the account (APP-29, DEV-3). The form names no
+/// account: the actor can only ever change their own.
+///
+/// DECISION: a taken address is checked in the actor's own file only;
+/// reading the other file would break DEV-3 for the admin.
+pub(super) async fn set_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<EmailForm>,
+) -> Response {
+    let actor = match require(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let m = msgs(actor.account.lang);
+    let me = &actor.account;
+    if !auth::permits(me, Action::ChangeEmail(me.id)) {
+        return (StatusCode::FORBIDDEN, m.err_forbidden).into_response();
+    }
+    let email = f.new_email.trim();
+    let refused = |error: &str| -> Response {
+        let err = EmailError { value: email, error };
+        let accounts = match actor.home {
+            Database::Ledger => lock(&state.ledger).accounts(),
+            Database::Dev => lock(&state.dev).accounts(),
+        };
+        let accounts = match accounts {
+            Ok(a) => a,
+            Err(e) => return internal(&e),
+        };
+        let panel = account_panel(m, &accounts, me, None, Some(&err));
+        if session::is_htmx(&headers) {
+            (StatusCode::BAD_REQUEST, panel).into_response()
+        } else {
+            let content = html! { div.page__stack data-view="settings" { (pages::section(2, m.accounts, &panel)) } };
+            let mut r = page(m, m.nav_settings, "settings", &content);
+            *r.status_mut() = StatusCode::BAD_REQUEST;
+            r
+        }
+    };
+    if email.is_empty() {
+        return refused(m.err_email_empty);
+    }
+    if email == me.email {
+        return see_other("/settings");
+    }
+    let done = match actor.home {
+        Database::Ledger => change_email(&mut *lock(&state.ledger), me, email),
+        Database::Dev => change_email(&mut *lock(&state.dev), me, email),
+    };
+    match done {
+        Ok(true) => see_other("/settings"),
+        Ok(false) => refused(m.err_email_taken),
+        Err(e) => internal(&e),
+    }
+}
+
+/// Set the address of `me` in `store`; `false` when another account
+/// already has it.
+fn change_email<K: Kind>(store: &mut Store<K>, me: &Account, email: &str) -> Result<bool, StoreError> {
+    // One lock for check and write; the unique index still refuses a race.
+    if store.account_by_email(email)?.is_some() {
+        return Ok(false);
+    }
+    match store.set_email(me.id, email) {
+        Ok(()) => Ok(true),
+        Err(StoreError::Conflict) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The `InstallSteps`: Home Screen steps for iPhone, then the button
+/// `app.js` enables once push can work (APP-33).
+fn install_steps(m: &Msgs, push_key: Option<&str>) -> Markup {
+    html! {
+        div.at-install {
+            ol.at-steps {
+                @for (i, step) in m.notif_steps.iter().enumerate() {
+                    li.at-step { span.at-index { "/0." (i + 1) } span { (step) } }
+                }
+            }
+            button.at-btn.at-btn--solid.at-btn--block type="button" id="enable-push" disabled
+                data-key=(push_key.unwrap_or("")) data-done=(m.notif_enabled) {
+                span { (m.notif_enable) }
+            }
+            p.at-muted id="push-hint" { (m.notif_unlock) }
+        }
+    }
+}
+
+/// The `AmountProposal`: the amount in force, the open proposal with one
+/// vote row per real witness, the worker's form and the witness's Agree
+/// button (APP-15, APP-16). Its `id` is the htmx target of both actions.
+///
+/// DECISION: no Decline button. The ledger records approvals only; a
+/// proposal stays open until every real witness agrees or the worker
+/// proposes another amount, so "decline" would set nothing.
+pub(super) fn amount_block(
+    m: &Msgs,
+    ledger: &Ledger,
+    accounts: &[Account],
+    me: &Account,
+    error: Option<&str>,
+) -> Markup {
+    let current = m.number(ledger.amount());
+    let witnesses: Vec<&Account> = accounts.iter().filter(|a| a.role.is_real_witness()).collect();
+    let proposal = ledger.proposal();
+    let agreed = |a: &Account| proposal.is_some_and(|p| p.approvals.contains(&WitnessId(a.id.0)));
+    html! {
+        section.at-proposal id="amount" {
+            @if let Some(p) = proposal {
+                p.at-label { (m.proposed_change) }
+                p.at-proposal__n {
+                    (current)
+                    span.at-proposal__to aria-label="→" { "→" }
+                    (m.number(p.amount))
+                    span.at-unit { "CHF" }
+                }
+                p.at-muted { (m.agreed_count(witnesses.iter().filter(|a| agreed(a)).count(), witnesses.len())) }
+                ul.at-people {
+                    @for w in &witnesses {
+                        li.at-person {
+                            span.at-person__name { (w.email) }
+                            @if agreed(w) { (pages::tag("received", m.vote_agreed)) }
+                            @else { (pages::tag("upcoming", m.vote_pending)) }
+                        }
+                    }
+                }
+                @if auth::permits(me, Action::ApproveAmount) && !agreed(me) {
+                    form.at-proposal__act method="post" action="/amount/approve"
+                        hx-post="/amount/approve" hx-target="#amount" hx-swap="outerHTML" {
+                        (pages::button(m.agree, Variant::Solid, false, false, None))
+                    }
+                }
+            } @else {
+                p.at-label { (m.amount_per_task) }
+                p.at-proposal__n { (current) span.at-unit { "CHF" } }
+            }
+            @if let Some(e) = error { p.row__error role="alert" { (e) } }
+            @if auth::permits(me, Action::ProposeAmount) {
+                form.at-proposal__form method="post" action="/amount/propose"
+                    hx-post="/amount/propose" hx-target="#amount" hx-swap="outerHTML" {
+                    (Field { hint: Some(m.propose_hint), ..Field::new(m.propose_field, "amount", "number", "off") }.render())
+                    (pages::button(m.propose, Variant::Outline, false, false, Some("→")))
+                }
+            }
+        }
+    }
+}
+
+/// A refused email change: the address typed and why it was refused.
+pub(super) struct EmailError<'a> {
+    pub value: &'a str,
+    pub error: &'a str,
+}
+
+/// The `AccountPanel`: the one worker, the witnesses, the actor's own
+/// email form (APP-29), and for the worker the invite block. Its `id` is
+/// the htmx target of `POST /invite` and `POST /email`.
+pub(super) fn account_panel(
+    m: &Msgs,
+    accounts: &[Account],
+    me: &Account,
+    invite: Option<&InviteOutcome>,
+    email_error: Option<&EmailError<'_>>,
+) -> Markup {
+    html! {
+        div.at-account id="accounts" {
+            header.at-account__head {
+                span.at-label { (m.accounts) }
+                span.at-mono { (accounts.len()) }
+            }
+            ul.at-people {
+                @for a in accounts {
+                    li.at-person {
+                        span.at-person__name {
+                            (a.email)
+                            @if a.id == me.id { span.at-index { " ·" } }
+                        }
+                        span.at-label { (match a.role {
+                            Role::Worker => m.role_worker,
+                            Role::Witness => m.role_witness,
+                            Role::Admin => m.role_admin,
+                        }) }
+                        span.at-muted { (match a.role {
+                            Role::Worker => m.owes_when_late,
+                            Role::Witness => m.active,
+                            Role::Admin => m.sees_fake,
+                        }) }
+                    }
+                }
+            }
+            @if auth::permits(me, Action::ChangeEmail(me.id)) {
+                form.page__form method="post" action="/email" hx-post="/email" hx-target="#accounts" hx-swap="outerHTML" {
+                    (Field { value: email_error.map_or(me.email.as_str(), |e| e.value),
+                             error: email_error.map(|e| e.error),
+                             ..Field::new(m.my_email, "new_email", "email", "email") }.render())
+                    (pages::button(m.change_email, Variant::Outline, false, false, Some("→")))
+                }
+            }
+            @if auth::permits(me, Action::CreateInvite) {
+                div.at-account__invite {
+                    @if let Some(inv) = invite {
+                        (Field { readonly: true, required: false, value: &inv.link, hint: Some(m.invite_hint),
+                                 ..Field::new(m.invite_link, "link", "text", "off") }.render())
+                        @if let Some((to, sent)) = &inv.mailed {
+                            @if *sent { p.at-muted role="status" { (m.mail_sent(to)) } }
+                            @else { p.row__error role="alert" { (m.mail_failed) } }
+                        }
+                    }
+                    form.page__form method="post" action="/invite" hx-post="/invite" hx-target="#accounts" hx-swap="outerHTML" {
+                        (Field { required: false, hint: Some(m.invite_email_hint),
+                                 ..Field::new(m.invite_email, "email", "email", "off") }.render())
+                        (pages::button(if invite.is_some() { m.invite_another } else { m.invite_witness },
+                                       Variant::Outline, false, false, Some("→")))
+                    }
+                }
+            }
+        }
+    }
+}
