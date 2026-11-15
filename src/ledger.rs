@@ -709,6 +709,15 @@ impl Ledger {
         if !pending {
             return;
         }
+        // DECISION: a task deleted in Vikunja (or whose project was
+        // archived) is gone from Atomanja too (APP-6a, David 2026-11-15):
+        // while gone, its pending occurrence is never decided, so it can
+        // never create a debt. If it comes back, APP-9 decides it at the
+        // first poll that sees it again. A decided occurrence keeps its
+        // outcome and debt (APP-10, APP-13): the early return above.
+        if seen == Seen::Gone {
+            return;
+        }
         if now <= deadline {
             // DECISION: a task that vanished or was archived shows no done
             // flag, so the last one seen before it went is kept (APP-9).
@@ -1401,32 +1410,44 @@ mod tests {
     }
 
     #[test]
-    fn app_9_deleted_never_seen_done_is_late() {
+    fn app_6a_deleted_pending_task_is_never_decided() {
+        // Deleted before its deadline: no decision, no debt, ever.
         let mut l = Ledger::new();
         poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
-        let c = poll(&mut l, &snap(vec![]), DAY + 1, &[]);
-        assert_eq!(
-            decisions(&c),
-            vec![(OccurrenceId(0), Outcome::Late, t(DAY + 1))]
-        );
+        poll(&mut l, &snap(vec![]), 10, &[]);
+        assert!(poll(&mut l, &snap(vec![]), DAY + 1, &[WitnessId(3)]).is_empty());
+        assert!(poll(&mut l, &snap(vec![]), 9 * DAY, &[WitnessId(3)]).is_empty());
+        assert_eq!(l.occurrences().outcome, vec![Outcome::Pending]);
+        assert!(l.debts().occurrence.is_empty());
         assert_eq!(l.events().kind, vec![EventKind::Deleted]);
 
-        // Deleted after being seen done before the deadline: met.
-        let mut m = Ledger::new();
-        poll(&mut m, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
-        poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
-        poll(&mut m, &snap(vec![]), 20, &[]);
-        let c = poll(&mut m, &snap(vec![]), DAY + 1, &[]);
+        // Gone in the same poll that passes the deadline: not decided.
+        let mut g = Ledger::new();
+        poll(&mut g, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let c = poll(&mut g, &snap(vec![]), DAY + 1, &[]);
+        assert!(decisions(&c).is_empty());
+        assert_eq!(g.events().kind, vec![EventKind::Deleted]);
+    }
+
+    #[test]
+    fn app_6a_task_back_after_deadline_is_decided_then() {
+        // An archived project brought back: decided at the first poll
+        // that sees it again, by APP-9.
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        poll(&mut l, &snap(vec![]), 10, &[]);
+        assert!(decisions(&poll(&mut l, &snap(vec![]), DAY + 1, &[])).is_empty());
+        let c = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), DAY + 2, &[]);
         assert_eq!(
             decisions(&c),
-            vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]
+            vec![(OccurrenceId(0), Outcome::Late, t(DAY + 2))]
         );
 
-        // First seen already done, then deleted: the first sight counts as
-        // an observation before the deadline.
-        let mut f = Ledger::new();
-        poll(&mut f, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
-        let c = poll(&mut f, &snap(vec![]), DAY + 1, &[]);
+        // Seen done before it went: met when it comes back.
+        let mut m = Ledger::new();
+        poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), 10, &[]);
+        poll(&mut m, &snap(vec![]), 20, &[]);
+        let c = poll(&mut m, &snap(vec![done(obs(1, Some(DAY)), 5)]), DAY + 1, &[]);
         assert_eq!(
             decisions(&c),
             vec![(OccurrenceId(0), Outcome::Met, t(DAY + 1))]

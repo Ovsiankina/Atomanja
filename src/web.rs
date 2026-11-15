@@ -515,6 +515,42 @@ mod tests {
     impl<T> Tap for T {}
 
     #[tokio::test]
+    async fn app_6a_deleted_task_leaves_the_views_unless_it_owes_a_debt() {
+        use crate::ledger::{Change, EventKind, OccurrenceId, TaskId, Timestamp};
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| testkit::account(s, "w@worker.test", Role::Worker));
+        let cookie = h.ledger(|s| testkit::session(s, &worker));
+        let gone = |occurrence: u32| Change::Event {
+            occurrence: OccurrenceId(occurrence),
+            kind: EventKind::Deleted,
+            new_due: None,
+            at: Timestamp(testkit::DEADLINE + 120),
+        };
+        // #61: late with a debt, then deleted: the debt still shows.
+        h.ledger(|s| testkit::late_debt(s, 61, None));
+        // #60: pending, then deleted: gone from every view.
+        h.ledger(|s| {
+            s.append(&[
+                Change::Recorded {
+                    occurrence: OccurrenceId(1),
+                    task: TaskId(60),
+                    deadline: Timestamp(testkit::DEADLINE + 86_400),
+                    at: Timestamp(testkit::DEADLINE),
+                },
+                gone(0),
+                gone(1),
+            ])
+            .expect("append");
+        });
+        for view in ["list", "table", "kanban", "gantt"] {
+            let page = h.get(&format!("/?view={view}"), Some(&cookie)).await;
+            assert_eq!(page.status, 200);
+            assert!(!page.body.contains("Tâche 60"), "{view}: deleted task hidden: {}", page.body);
+            assert!(page.body.contains("Tâche 61"), "{view}: deleted task with a debt kept: {}", page.body);
+        }
+    }
+
+    #[tokio::test]
     async fn app_31_worker_view_shows_titles_debts_totals() {
         let h = Harness::start().await;
         let p = rich_ledger(&h);

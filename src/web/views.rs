@@ -280,12 +280,37 @@ struct Item {
     deadline: Timestamp,
 }
 
+/// Tasks whose current occurrence (the last one recorded for the task)
+/// was last seen gone from Vikunja: deleted, or its project archived.
+fn gone_tasks(ledger: &Ledger) -> std::collections::BTreeSet<TaskId> {
+    let occ = ledger.occurrences();
+    let events = ledger.events();
+    let mut current: BTreeMap<TaskId, usize> = BTreeMap::new();
+    for (o, &task) in occ.task.iter().enumerate() {
+        current.insert(task, o);
+    }
+    let mut last: BTreeMap<usize, EventKind> = BTreeMap::new();
+    for (e, o) in events.occurrence.iter().enumerate() {
+        last.insert(o.0 as usize, events.kind[e]);
+    }
+    current
+        .into_iter()
+        .filter(|(_, o)| last.get(o) == Some(&EventKind::Deleted))
+        .map(|(task, _)| task)
+        .collect()
+}
+
 /// Every occurrence, late first, then sent, upcoming, settled; by
 /// deadline inside each.
 fn items(ledger: &Ledger) -> Vec<Item> {
     let by_occ = debt_by_occurrence(ledger);
     let occ = ledger.occurrences();
+    let gone = gone_tasks(ledger);
     let mut out: Vec<Item> = (0..occ.task.len())
+        // DECISION: a task deleted in Vikunja leaves every view (APP-6a),
+        // all its occurrences with it, except one that owes a debt: debts
+        // are never hidden or forgiven (APP-13, APP-14).
+        .filter(|&o| by_occ[o].is_some() || !gone.contains(&occ.task[o]))
         .map(|o| Item {
             o,
             d: by_occ[o],
