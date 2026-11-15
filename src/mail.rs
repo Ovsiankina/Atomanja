@@ -133,6 +133,10 @@ impl Mailer {
                     smtp.user.clone(),
                     smtp.password.clone(),
                 ))
+                // DECISION: 10 s socket timeout instead of lettre's 60 s, so
+                // a dead SMTP server never holds a connection or a task for
+                // long (SRS 5.1); web also bounds the whole send.
+                .timeout(Some(std::time::Duration::from_secs(10)))
                 .build();
         Ok(Mailer { transport, from })
     }
