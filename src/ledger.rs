@@ -118,6 +118,8 @@ pub enum EventKind {
     Removed = 2,
     /// Task no longer visible to the token.
     Deleted = 3,
+    /// Due date set again, equal to the recorded deadline (APP-6).
+    Restored = 4,
 }
 
 /// One ledger fact, as returned by operations, persisted by `store`
@@ -686,13 +688,12 @@ impl Ledger {
                 // recorded deadline, not the previous due date, so the
                 // recorded deadline only ever moves earlier (APP-7), and a
                 // move back towards it is logged as MovedLater.
-                // DECISION: a due date set back to exactly the recorded
-                // deadline (after Removed/Deleted) is also logged as
-                // MovedLater with new_due == recorded. Logging nothing
-                // would leave last_seen stale (only an Event updates it on
-                // replay), so a later removal would go unlogged. A clearer
-                // kind needs a new pub EventKind variant: docs/deferred.md.
+                // DECISION: a due date set to exactly the recorded deadline
+                // is logged as Restored, never skipped: only an Event
+                // updates last_seen on replay, so skipping it would leave a
+                // later removal unlogged (APP-6).
                 Seen::Due(d) if d < recorded => (EventKind::MovedEarlier, Some(d)),
+                Seen::Due(d) if d == recorded => (EventKind::Restored, Some(d)),
                 Seen::Due(d) => (EventKind::MovedLater, Some(d)),
             };
             if kind == EventKind::MovedEarlier && pending {
@@ -1096,6 +1097,24 @@ mod tests {
     }
 
     #[test]
+    fn app_6_due_restored_to_recorded_is_logged_as_restored() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        poll(&mut l, &snap(vec![obs(1, None)]), 10, &[]);
+        let c = poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 20, &[]);
+        assert_eq!(
+            c,
+            vec![Change::Event {
+                occurrence: OccurrenceId(0),
+                kind: EventKind::Restored,
+                new_due: Some(t(DAY)),
+                at: t(20),
+            }]
+        );
+        assert_eq!(l.occurrences().deadline, vec![t(DAY)]);
+    }
+
+    #[test]
     fn app_6_due_restored_to_recorded_then_removed_again_is_logged() {
         // Restoring the due date to exactly the recorded deadline must
         // leave the ledger able to log a later removal (APP-6).
@@ -1103,6 +1122,10 @@ mod tests {
         poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
         poll(&mut l, &snap(vec![obs(1, None)]), 10, &[]);
         poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 20, &[]);
+        assert_eq!(
+            l.events().kind,
+            vec![EventKind::Removed, EventKind::Restored]
+        );
         assert!(poll(&mut l, &snap(vec![obs(1, Some(DAY))]), 25, &[]).is_empty());
         let c = poll(&mut l, &snap(vec![obs(1, None)]), 30, &[]);
         assert_eq!(
