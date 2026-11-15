@@ -7,6 +7,7 @@
 //! `store` persists [`Account`] and token rows; `web` asks this module
 //! whether an account may act, and which database its requests go to.
 
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use time::{Duration, OffsetDateTime};
 
 /// Account id, as stored. A witness's id is also its
@@ -76,14 +77,23 @@ pub const MIN_PASSWORD_LEN: usize = 8;
 ///
 /// `PasswordTooShort`, `Hashing`.
 pub fn hash_password(plain: &str) -> Result<PasswordHash, AuthError> {
-    let _ = plain;
-    todo!()
+    if plain.chars().count() < MIN_PASSWORD_LEN {
+        return Err(AuthError::PasswordTooShort);
+    }
+    // DECISION: argon2 default params (Argon2id v19); salt from the
+    // crate's OS-RNG path, so no extra rand plumbing here.
+    let phc: argon2::password_hash::phc::PasswordHash = argon2::Argon2::default()
+        .hash_password(plain.as_bytes())
+        .map_err(|_| AuthError::Hashing)?;
+    Ok(PasswordHash(phc.to_string()))
 }
 
 /// `true` if `plain` matches `hash` (APP-27).
 pub fn verify_password(hash: &PasswordHash, plain: &str) -> bool {
-    let _ = (hash, plain);
-    todo!()
+    // DECISION: a malformed stored hash verifies as `false`, never panics.
+    argon2::Argon2::default()
+        .verify_password(plain.as_bytes(), hash.0.as_str())
+        .is_ok()
 }
 
 /// What a token is for. Each kind has its own lifetime.
@@ -211,8 +221,7 @@ pub enum AuthError {
 
 impl std::fmt::Debug for PasswordHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!()
+        f.write_str("PasswordHash(<redacted>)")
     }
 }
 
@@ -255,9 +264,36 @@ mod tests {
     }
 
     // auth-02
-    #[test] fn app_27_password_hash_verifies_only_same_password() { todo!() }
-    #[test] fn app_27_hash_never_equals_plaintext() { todo!() }
-    #[test] fn auth_short_password_rejected() { todo!() }
+    #[test]
+    fn app_27_password_hash_verifies_only_same_password() {
+        let hash = hash_password("correct horse").unwrap();
+        assert!(verify_password(&hash, "correct horse"));
+        assert!(!verify_password(&hash, "correct hors"));
+        assert!(!verify_password(&hash, "Correct horse"));
+        assert!(!verify_password(&PasswordHash("not a phc".into()), "correct horse"));
+    }
+
+    #[test]
+    fn app_27_hash_never_equals_plaintext() {
+        let plain = "correct horse";
+        let a = hash_password(plain).unwrap();
+        let b = hash_password(plain).unwrap();
+        assert_ne!(a.0, plain);
+        assert!(!a.0.contains(plain));
+        assert!(a.0.starts_with("$argon2"));
+        // Random salt: same password, different hashes.
+        assert_ne!(a, b);
+        // Debug never prints the hash.
+        assert!(!format!("{a:?}").contains(&a.0));
+    }
+
+    #[test]
+    fn auth_short_password_rejected() {
+        assert_eq!(hash_password("1234567"), Err(AuthError::PasswordTooShort));
+        // Length counts characters, not bytes.
+        assert_eq!(hash_password("ééééééé"), Err(AuthError::PasswordTooShort));
+        assert!(hash_password("12345678").is_ok());
+    }
 
     // auth-03
     #[test] fn app_26_invite_single_use() { todo!() }
