@@ -387,6 +387,12 @@ impl Batch {
         }
     }
 
+    /// The one-time met/late decision (APP-9, APP-10).
+    fn decide(&mut self, occurrence: OccurrenceId, met: bool, now: Timestamp) {
+        let outcome = if met { Outcome::Met } else { Outcome::Late };
+        self.out.push(Change::Decided { occurrence, outcome, at: now });
+    }
+
     /// Start a new occurrence.
     fn record(&mut self, o: &Observation, deadline: Timestamp, now: Timestamp) {
         let occurrence = OccurrenceId(self.next_occ);
@@ -437,6 +443,9 @@ impl Ledger {
                     }
                 }
             }
+            Change::Decided { occurrence, outcome, .. } => {
+                self.occurrences.outcome[idx(occurrence.0)] = outcome;
+            }
             _ => todo!(),
         }
     }
@@ -484,6 +493,13 @@ impl Ledger {
         batch.out
     }
 
+    /// APP-8: recurring, and marked done after the current occurrence
+    /// was recorded. The caller has checked that the due date changed.
+    fn is_advance(&self, i: usize, o: &Observation) -> bool {
+        let recurring = o.repeat_after_secs > 0 || o.repeat_mode == RepeatMode::Monthly;
+        recurring && o.done_at.is_some_and(|d| d > self.tracking.recorded_at[i])
+    }
+
     /// One poll's changes for a task that already has an occurrence.
     fn step_tracked(
         &self,
@@ -499,7 +515,26 @@ impl Ledger {
             Some(o) if o.archived => Seen::Gone,
             Some(o) => o.due.map_or(Seen::NoDue, Seen::Due),
         };
-        if seen != self.tracking.last_seen[i] {
+        let changed = seen != self.tracking.last_seen[i];
+        if let (true, Some(o), Seen::Due(new_due)) = (changed, o, seen) {
+            if self.is_advance(i, o) {
+                if self.occurrences.outcome[i] == Outcome::Pending {
+                    // The mark-done that advanced it is the done proof.
+                    let met = o.done_at.is_some_and(|d| d <= recorded)
+                        || self.tracking.seen_done[i];
+                    batch.decide(occ, met, now);
+                }
+                // DECISION: a new occurrence whose due date is already past
+                // when first seen is not recorded, as APP-5 says for any
+                // first sight; the closed one stays current until the next
+                // advance into the future.
+                if new_due > now {
+                    batch.record(o, new_due, now);
+                }
+                return;
+            }
+        }
+        if changed {
             let (kind, new_due) = match seen {
                 Seen::Gone => (EventKind::Deleted, None),
                 Seen::NoDue => (EventKind::Removed, None),
@@ -822,10 +857,100 @@ mod tests {
     }
 
     // ledger-03
-    #[test] fn app_8_recurrence_advance_closes_and_opens_occurrence() { todo!() }
-    #[test] fn app_8_recurrence_advance_is_not_a_deadline_event() { todo!() }
-    #[test] fn app_8_manual_move_of_recurring_task_is_a_deadline_event() { todo!() }
-    #[test] fn app_8_advance_while_down_detected_from_done_at() { todo!() }
+    #[test]
+    fn app_8_recurrence_advance_closes_and_opens_occurrence() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![daily(1, DAY, None)]), 0, &[]);
+        // Marked done at 10; Vikunja moves the due date one day on.
+        let changes = poll(&mut l, &snap(vec![daily(1, 2 * DAY, Some(10))]), 20, &[]);
+        assert_eq!(
+            changes,
+            vec![
+                Change::Decided { occurrence: OccurrenceId(0), outcome: Outcome::Met, at: t(20) },
+                Change::Recorded {
+                    occurrence: OccurrenceId(1),
+                    task: TaskId(1),
+                    deadline: t(2 * DAY),
+                    at: t(20),
+                },
+            ]
+        );
+        let o = l.occurrences();
+        assert_eq!(o.outcome, vec![Outcome::Met, Outcome::Pending]);
+        assert_eq!(o.deadline, vec![t(DAY), t(2 * DAY)]);
+        // Same snapshot again: the new occurrence is stable.
+        assert!(poll(&mut l, &snap(vec![daily(1, 2 * DAY, Some(10))]), 30, &[]).is_empty());
+    }
+
+    #[test]
+    fn app_8_recurrence_advance_is_not_a_deadline_event() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![daily(1, DAY, None)]), 0, &[]);
+        let changes = poll(&mut l, &snap(vec![daily(1, 2 * DAY, Some(10))]), 20, &[]);
+        assert!(!changes.iter().any(|c| matches!(c, Change::Event { .. })));
+        assert!(l.events().kind.is_empty());
+        // Monthly mode counts as recurring too, with repeat_after 0.
+        let mut m = Ledger::new();
+        let mut o = obs(2, Some(DAY));
+        o.repeat_mode = RepeatMode::Monthly;
+        poll(&mut m, &snap(vec![o.clone()]), 0, &[]);
+        o.due = Some(t(31 * DAY));
+        o.done_at = Some(t(10));
+        poll(&mut m, &snap(vec![o]), 20, &[]);
+        assert!(m.events().kind.is_empty());
+        assert_eq!(m.occurrences().task.len(), 2);
+    }
+
+    #[test]
+    fn app_8_manual_move_of_recurring_task_is_a_deadline_event() {
+        let mut l = Ledger::new();
+        // done_at from an earlier occurrence, before this one was recorded.
+        poll(&mut l, &snap(vec![daily(1, DAY, Some(50))]), 100, &[]);
+        let changes = poll(&mut l, &snap(vec![daily(1, 2 * DAY, Some(50))]), 200, &[]);
+        assert_eq!(
+            changes,
+            vec![Change::Event {
+                occurrence: OccurrenceId(0),
+                kind: EventKind::MovedLater,
+                new_due: Some(t(2 * DAY)),
+                at: t(200),
+            }]
+        );
+        assert_eq!(l.occurrences().task.len(), 1);
+        assert_eq!(l.occurrences().outcome, vec![Outcome::Pending]);
+        // Not recurring at all: a done_at after recording is no advance.
+        let mut n = Ledger::new();
+        poll(&mut n, &snap(vec![obs(1, Some(DAY))]), 0, &[]);
+        let mut o = obs(1, Some(2 * DAY));
+        o.done_at = Some(t(10));
+        poll(&mut n, &snap(vec![o]), 20, &[]);
+        assert_eq!(n.events().kind, vec![EventKind::MovedLater]);
+        assert_eq!(n.occurrences().task.len(), 1);
+    }
+
+    #[test]
+    fn app_8_advance_while_down_detected_from_done_at() {
+        let mut l = Ledger::new();
+        poll(&mut l, &snap(vec![daily(1, DAY, None)]), 0, &[]);
+        // Down from 1h to after the deadline. Meanwhile the task was
+        // marked done before its deadline and advanced; done is false
+        // again, only done_at shows it.
+        let now = DAY + 5 * HOUR;
+        let changes = poll(&mut l, &snap(vec![daily(1, 2 * DAY, Some(DAY - HOUR))]), now, &[]);
+        assert_eq!(
+            changes,
+            vec![
+                Change::Decided { occurrence: OccurrenceId(0), outcome: Outcome::Met, at: t(now) },
+                Change::Recorded {
+                    occurrence: OccurrenceId(1),
+                    task: TaskId(1),
+                    deadline: t(2 * DAY),
+                    at: t(now),
+                },
+            ]
+        );
+        assert!(l.events().kind.is_empty());
+    }
 
     // ledger-04
     #[test] fn app_9_done_before_deadline_is_met() { todo!() }
