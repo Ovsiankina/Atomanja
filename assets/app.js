@@ -30,7 +30,9 @@
   var key = btn.getAttribute('data-key');
 
   function bytes(b64) {
-    var s = (b64 + '===='.slice((b64.length + 3) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+    // Pad to a multiple of 4: length%4 of 2 needs "==", 3 needs "=", 0 none.
+    // The old formula over-padded the 87-char VAPID key and atob threw.
+    var s = (b64 + '===='.slice(b64.length % 4 || 4)).replace(/-/g, '+').replace(/_/g, '/');
     var raw = atob(s), out = new Uint8Array(raw.length);
     for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
     return out;
@@ -57,9 +59,18 @@
     if (hint) hint.hidden = true;
   });
 
+  // Every failure is shown under the button: a silent one looks like a
+  // dead button on a phone, where there is no console.
+  function fail(what) {
+    btn.disabled = false;
+    if (hint) { hint.hidden = false; hint.textContent = '\u26a0 ' + what; }
+  }
+
   btn.addEventListener('click', function () {
+    btn.disabled = true;
+    if (hint) { hint.hidden = false; hint.textContent = '\u2026'; }
     Notification.requestPermission().then(function (perm) {
-      if (perm !== 'granted') return null;
+      if (perm !== 'granted') { fail('permission: ' + perm); return null; }
       return navigator.serviceWorker.ready.then(function (reg) {
         return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes(key) });
       }).then(function (sub) {
@@ -69,7 +80,9 @@
           credentials: 'same-origin',
           body: JSON.stringify(sub)
         });
-      }).then(function (res) { if (res && res.ok) done(); });
-    });
+      }).then(function (res) {
+        if (res.ok) done(); else fail('server: ' + res.status);
+      });
+    }).catch(function (e) { fail((e && e.message) || String(e)); });
   });
 })();
