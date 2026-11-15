@@ -51,8 +51,11 @@ use crate::store::{DevDb, LedgerDb, Store};
 mod actions;
 mod handlers;
 mod i18n;
+mod links;
+mod outbox;
 mod pages;
 mod session;
+mod settings;
 mod views;
 
 /// Everything the handlers share. Cheap to clone (all `Arc` or
@@ -88,6 +91,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/", get(handlers::index))
         .route("/login", get(handlers::login_form).post(handlers::login))
         .route("/logout", post(handlers::logout))
+        .route("/settings", get(settings::settings))
+        .route("/invite", post(links::create_invite))
+        .route("/invite/{token}", get(links::accept_form).post(links::accept))
         .route("/debts/{id}/claim", post(actions::claim))
         .with_state(state)
 }
@@ -253,8 +259,98 @@ mod tests {
     }
 
     // web-02
-    #[test] fn app_26_worker_creates_invite_link_shown_and_mailed() { todo!() }
-    #[test] fn app_27_invite_accept_sets_witness_password() { todo!() }
+    /// The `/invite/<token>` link in `text`, if any.
+    fn invite_link(base: &str, text: &str) -> Option<String> {
+        let prefix = format!("{base}/invite/");
+        let start = text.find(&prefix)?;
+        let rest = &text[start + prefix.len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        Some(format!("{prefix}{}", &rest[..end]))
+    }
+
+    #[tokio::test]
+    async fn app_26_worker_creates_invite_link_shown_and_mailed() {
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| testkit::account(s, "worker@atomanja.test", Role::Worker));
+        let cookie = h.ledger(|s| testkit::session(s, &worker));
+
+        let r = h.post("/invite", Some(&cookie), &[("email", "app26-new@witness.test")]).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        let link = invite_link(&h.base, &r.body).expect("link shown to the worker");
+        let secret = link.rsplit('/').next().unwrap().to_owned();
+        let stored = h.ledger(|s| s.token(&Token(secret)).unwrap()).expect("token stored");
+        assert_eq!(stored.kind, TokenKind::Invite);
+        assert_eq!(stored.account, None);
+        assert!(!stored.used);
+
+        let mails = super::outbox::sent_to("app26-new@witness.test");
+        assert_eq!(mails.len(), 1, "mailed once to the address the worker entered");
+        assert!(mails[0].body.contains(&link), "{}", mails[0].body);
+        // The test SMTP host refuses connections: the page says so and
+        // still shows the link (SRS 5.1).
+        assert!(r.body.contains("E-mail non envoyé. Copiez le lien."), "{}", r.body);
+
+        // Without an address: a fresh link, shown only.
+        let hx = h.hx_post("/invite", Some(&cookie), &[("email", "")]).await;
+        assert_eq!(hx.status, 200);
+        assert!(!hx.body.contains("<html"), "htmx gets a fragment");
+        let second = invite_link(&h.base, &hx.body).expect("second link");
+        assert_ne!(second, link);
+
+        // A witness cannot invite (APP-26: the worker generates links).
+        let witness = h.ledger(|s| testkit::account(s, "w@witness.test", Role::Witness));
+        let wc = h.ledger(|s| testkit::session(s, &witness));
+        let denied = h.post("/invite", Some(&wc), &[("email", "x@witness.test")]).await;
+        assert_eq!(denied.status, 403);
+        assert!(super::outbox::sent_to("x@witness.test").is_empty());
+    }
+
+    #[tokio::test]
+    async fn app_27_invite_accept_sets_witness_password() {
+        let h = Harness::start().await;
+        h.ledger(|s| testkit::account(s, "worker@atomanja.test", Role::Worker));
+        let secret = h.ledger(|s| {
+            testkit::token(s, TokenKind::Invite, None, time::Duration::hours(1), false)
+        });
+        let path = format!("/invite/{secret}");
+
+        let form = h.get(&path, None).await;
+        assert_eq!(form.status, 200);
+        assert!(form.body.contains("worker@atomanja.test"), "names who asks: {}", form.body);
+        assert!(form.body.contains(r#"name="repeat""#));
+
+        let bad = h
+            .post(&path, None, &[("email", "new@witness.test"), ("password", "witness pass"), ("repeat", "other pass")])
+            .await;
+        assert_eq!(bad.status, 400);
+        assert!(bad.body.contains("Les deux mots de passe diffèrent."), "{}", bad.body);
+        assert!(h.ledger(|s| s.account_by_email("new@witness.test").unwrap()).is_none());
+
+        let ok = h
+            .post(&path, None, &[("email", "new@witness.test"), ("password", "witness pass"), ("repeat", "witness pass")])
+            .await;
+        assert_eq!(ok.status, 303, "{}", ok.body);
+        assert_eq!(ok.location(), Some("/"));
+        let cookie = ok.session_cookie().expect("signed in after accepting");
+        let account = h
+            .ledger(|s| s.account_by_email("new@witness.test").unwrap())
+            .expect("witness account");
+        assert_eq!(account.role, Role::Witness);
+        assert!(crate::auth::verify_password(&account.password_hash, "witness pass"));
+        assert!(h.ledger(|s| s.token(&Token(secret.clone())).unwrap()).unwrap().used);
+        let view = h.get("/", Some(&cookie)).await;
+        assert!(view.body.contains(r#"data-view="witness""#));
+
+        // Single use: the same link never creates a second account.
+        let again = h
+            .post(&path, None, &[("email", "other@witness.test"), ("password", "witness pass"), ("repeat", "witness pass")])
+            .await;
+        assert_eq!(again.status, 410);
+        assert!(again.session_cookie().is_none());
+        assert!(h.ledger(|s| s.account_by_email("other@witness.test").unwrap()).is_none());
+    }
 
     // web-03
     #[test] fn app_28_reset_request_sends_mail() { todo!() }
