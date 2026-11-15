@@ -1,0 +1,10 @@
+# ov-agentic-workflow (local copy, not versioned)
+/CLAUDE.md
+/.claude/skills/
+/workflows/
+/docs/
+/clippy.toml
+
+# build
+/target
+*.sqlite
