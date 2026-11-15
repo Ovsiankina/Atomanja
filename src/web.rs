@@ -536,7 +536,39 @@ mod tests {
     }
 
     // web-05
-    #[test] fn app_32_witness_view_never_contains_task_title() { todo!() }
+    const TITLES: [&str; 6] = ["Pay rent", "Write report", "Call dentist", "Water plants", "File taxes", "Fix bike"];
+
+    #[tokio::test]
+    async fn app_32_witness_view_never_contains_task_title() {
+        let h = Harness::start().await;
+        let p = rich_ledger(&h);
+        let ca = h.ledger(|s| testkit::session(s, &p.a));
+        let cb = h.ledger(|s| testkit::session(s, &p.b));
+        for (cookie, path) in [(&ca, "/"), (&ca, "/settings"), (&cb, "/"), (&cb, "/settings")] {
+            let page = h.get(path, Some(cookie)).await;
+            assert_eq!(page.status, 200, "{path}");
+            for title in TITLES {
+                assert!(!page.body.contains(title), "{path} leaks {title:?}: {}", page.body);
+            }
+        }
+        let page = h.get("/", Some(&ca)).await.body;
+        assert!(page.contains(r#"data-view="witness""#));
+        for n in 47..=52 {
+            assert!(page.contains(&format!("Tâche {n}")), "task number only: Tâche {n}");
+        }
+        assert!(page.contains("14 nov."), "recorded deadline");
+        for word in ["En retard", "Tenu", "À venir", "Envoyé", "Reçu"] {
+            assert!(page.contains(word), "status {word}");
+        }
+        assert!(page.contains("Échéance déplacée au 20 nov."), "deadline events");
+        assert!(page.contains("Réclamée par vous"));
+        assert!(page.contains(r#"action="/debts/2/claim""#), "unclaimed #49 claimable");
+        assert!(page.contains(r#"action="/debts/1/received""#), "owner marks #48 received");
+        assert!(!page.contains("/sent\""), "witnesses never mark sent");
+        let other = h.get("/", Some(&cb)).await.body;
+        assert!(other.contains(r#"action="/debts/2/claim""#));
+        assert!(!other.contains("/received\""), "only the owner marks received");
+    }
 
     // web-06
     #[test] fn app_18_claim_action_second_claim_rejected() { todo!() }
