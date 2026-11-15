@@ -94,6 +94,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/settings", get(settings::settings))
         .route("/invite", post(links::create_invite))
         .route("/invite/{token}", get(links::accept_form).post(links::accept))
+        .route("/reset", get(links::reset_request_form).post(links::reset_request))
+        .route("/reset/{token}", get(links::reset_form).post(links::reset))
         .route("/debts/{id}/claim", post(actions::claim))
         .with_state(state)
 }
@@ -353,8 +355,90 @@ mod tests {
     }
 
     // web-03
-    #[test] fn app_28_reset_request_sends_mail() { todo!() }
-    #[test] fn web_expired_or_used_link_shows_error_page() { todo!() }
+    #[tokio::test]
+    async fn app_28_reset_request_sends_mail() {
+        let h = Harness::start().await;
+        let email = "app28-worker@atomanja.test";
+        let worker = h.ledger(|s| testkit::account_with_password(s, email, "old password", Role::Worker));
+        h.ledger(|s| s.set_lang(worker.id, crate::config::Lang::En).unwrap());
+
+        let form = h.get("/reset", None).await;
+        assert_eq!(form.status, 200);
+        assert!(form.body.contains(r#"name="email""#));
+
+        let r = h.post("/reset", None, &[("email", email)]).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("un lien est en route"), "{}", r.body);
+        let mails = super::outbox::sent_to(email);
+        assert_eq!(mails.len(), 1);
+        assert!(mails[0].body.contains("password"), "account language (APP-39): {}", mails[0].body);
+        let prefix = format!("{}/reset/", h.base);
+        let start = mails[0].body.find(&prefix).expect("link in mail") + prefix.len();
+        let secret: String = mails[0].body[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        let stored = h.ledger(|s| s.token(&Token(secret.clone())).unwrap()).expect("stored");
+        assert_eq!(stored.kind, TokenKind::Reset);
+        assert_eq!(stored.account, Some(worker.id));
+
+        // Unknown address: the same answer, no mail (no account probing).
+        let unknown = h.post("/reset", None, &[("email", "app28-nobody@atomanja.test")]).await;
+        assert_eq!(unknown.status, 200);
+        assert!(unknown.body.contains("un lien est en route"));
+        assert!(super::outbox::sent_to("app28-nobody@atomanja.test").is_empty());
+
+        // Following the link sets the new password; it signs nobody in.
+        let path = format!("/reset/{secret}");
+        assert_eq!(h.get(&path, None).await.status, 200);
+        let done = h
+            .post(&path, None, &[("password", "new password"), ("repeat", "new password")])
+            .await;
+        assert_eq!(done.status, 303, "{}", done.body);
+        assert_eq!(done.location(), Some("/login?done=reset"));
+        assert!(done.session_cookie().is_none());
+        let account = h.ledger(|s| s.account(worker.id).unwrap()).unwrap();
+        assert!(crate::auth::verify_password(&account.password_hash, "new password"));
+        let login = h.post("/login", None, &[("email", email), ("password", "new password")]).await;
+        assert_eq!(login.status, 303);
+    }
+
+    #[tokio::test]
+    async fn web_expired_or_used_link_shows_error_page() {
+        use time::Duration;
+        let h = Harness::start().await;
+        let worker = h.ledger(|s| testkit::account_with_password(s, "w@atomanja.test", "old password", Role::Worker));
+        let mut cases = h.ledger(|s| {
+            vec![
+                ("reset", testkit::token(s, TokenKind::Reset, Some(&worker), Duration::hours(2), false), 410, "Ce lien a expiré."),
+                ("reset", testkit::token(s, TokenKind::Reset, Some(&worker), Duration::minutes(5), true), 410, "Ce lien a déjà servi."),
+                ("invite", testkit::token(s, TokenKind::Invite, None, Duration::days(8), false), 410, "Ce lien a expiré."),
+                ("invite", testkit::token(s, TokenKind::Invite, None, Duration::days(1), true), 410, "Ce lien a déjà servi."),
+                // A session secret is not a reset link.
+                ("reset", testkit::session(s, &worker), 404, "Ce lien n'est pas valide."),
+            ]
+        });
+        cases.push(("reset", "no-such-token".to_owned(), 404, "Ce lien n'est pas valide."));
+        cases.push(("invite", "no-such-token".to_owned(), 404, "Ce lien n'est pas valide."));
+
+        for (kind, secret, status, text) in cases {
+            let path = format!("/{kind}/{secret}");
+            let page = h.get(&path, None).await;
+            assert_eq!(page.status, status, "GET {path}");
+            assert!(page.body.contains(text), "GET {path}: {}", page.body);
+            assert!(page.session_cookie().is_none());
+
+            let post = h
+                .post(&path, None, &[("email", "late@witness.test"), ("password", "hacked password"), ("repeat", "hacked password")])
+                .await;
+            assert_eq!(post.status, status, "POST {path}");
+            assert!(post.body.contains(text), "POST {path}: {}", post.body);
+            assert!(post.session_cookie().is_none(), "never signs anyone in");
+        }
+        let account = h.ledger(|s| s.account(worker.id).unwrap()).unwrap();
+        assert!(crate::auth::verify_password(&account.password_hash, "old password"));
+        assert!(h.ledger(|s| s.account_by_email("late@witness.test").unwrap()).is_none());
+    }
 
     // web-04
     #[test] fn app_31_worker_view_shows_titles_debts_totals() { todo!() }

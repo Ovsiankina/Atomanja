@@ -15,7 +15,7 @@ use super::pages::{self, AuthCard, Field};
 use super::session::{self, internal, lock, now, see_other};
 use super::settings::{self, InviteOutcome};
 use super::{outbox, AppState};
-use crate::auth::{self, AuthError, IssuedToken, Role, Token, TokenKind};
+use crate::auth::{self, Account, AuthError, Database, IssuedToken, Role, Token, TokenKind};
 use crate::config::Lang;
 use crate::mail;
 use crate::store::{Kind, Store, StoreError};
@@ -236,5 +236,191 @@ pub(super) async fn accept(
         }
         Err(Some(msg)) => bad(msg),
         Err(None) => internal(&m.err_server),
+    }
+}
+
+/// The reset request form field.
+#[derive(Deserialize)]
+pub(super) struct ResetRequest {
+    #[serde(default)]
+    email: String,
+}
+
+/// The reset request form, with an optional error.
+fn reset_request_page(error: Option<&str>) -> Markup {
+    let m = msgs(Lang::Fr);
+    let card = AuthCard {
+        action: "/reset",
+        label: m.reset_label,
+        title: m.reset_title,
+        big_title: false,
+        intro: Some(m.reset_intro),
+        fields: vec![Field::new(m.email, "email", "email", "username")],
+        error,
+        notice: None,
+        submit: m.send_link,
+        footer: Some(("/login", m.back_to_login)),
+    };
+    public_page(m.reset_label, &card.render())
+}
+
+/// `GET /reset`.
+pub(super) async fn reset_request_form() -> Markup {
+    reset_request_page(None)
+}
+
+/// A reset token for the account with `email` in `store`, if any.
+/// `admin_only` is set for the dev file (DEV-3).
+fn issue_reset<K: Kind>(
+    store: &mut Store<K>,
+    email: &str,
+    admin_only: bool,
+) -> Result<Option<(Account, Token)>, StoreError> {
+    let Some(account) = store.account_by_email(email)? else {
+        return Ok(None);
+    };
+    if admin_only && account.role != Role::Admin {
+        return Ok(None);
+    }
+    let token = Token::generate();
+    store.insert_token(&IssuedToken {
+        token: token.clone(),
+        kind: TokenKind::Reset,
+        account: Some(account.id),
+        issued_at: now(),
+        used: false,
+    })?;
+    Ok(Some((account, token)))
+}
+
+/// `POST /reset`: email a 1-hour single-use link to the account, if the
+/// address has one (APP-28). The answer is the same either way.
+pub(super) async fn reset_request(
+    State(state): State<AppState>,
+    Form(f): Form<ResetRequest>,
+) -> Response {
+    let m = msgs(Lang::Fr);
+    let email = f.email.trim().to_owned();
+    if email.is_empty() {
+        return (StatusCode::BAD_REQUEST, reset_request_page(Some(m.err_email_empty))).into_response();
+    }
+    let issued = match issue_reset(&mut *lock(&state.ledger), &email, false) {
+        Ok(None) => issue_reset(&mut *lock(&state.dev), &email, true),
+        other => other,
+    };
+    match issued {
+        Ok(Some((account, token))) => {
+            let url = link(&state, "reset", &token);
+            let expires = now() + TokenKind::Reset.lifetime();
+            let mail = mail::reset(&account.email, &url, expires, account.lang);
+            // DECISION: the answer does not say whether the mail left, so
+            // the page is identical for known and unknown addresses; the
+            // failure is logged by `deliver` (SRS 5.1).
+            outbox::deliver(&state, mail).await;
+        }
+        Ok(None) => {}
+        Err(e) => return internal(&e),
+    }
+    let card = pages::notice_card(m.reset_label, m.reset_title, m.reset_sent, ("/login", m.back_to_login));
+    public_page(m.reset_label, &card).into_response()
+}
+
+/// Where a reset link lives: ledger first, then the dev file for the
+/// admin only (DEV-3).
+fn find_reset(
+    state: &AppState,
+    token: &Token,
+) -> Result<Result<(IssuedToken, Database), LinkError>, StoreError> {
+    match check_link(&*lock(&state.ledger), token, TokenKind::Reset)? {
+        Err(LinkError::Unknown) => {}
+        found => return Ok(found.map(|t| (t, Database::Ledger))),
+    }
+    let dev = lock(&state.dev);
+    match check_link(&*dev, token, TokenKind::Reset)? {
+        Ok(row) => {
+            let admin = match row.account {
+                Some(id) => dev.account(id)?.is_some_and(|a| a.role == Role::Admin),
+                None => false,
+            };
+            Ok(if admin { Ok((row, Database::Dev)) } else { Err(LinkError::Unknown) })
+        }
+        Err(e) => Ok(Err(e)),
+    }
+}
+
+/// The new-password form, with an optional error.
+fn reset_page(secret: &str, error: Option<&str>) -> Markup {
+    let m = msgs(Lang::Fr);
+    let action = format!("/reset/{secret}");
+    let card = AuthCard {
+        action: &action,
+        label: m.reset_label,
+        title: m.set_password,
+        big_title: false,
+        intro: None,
+        fields: vec![
+            Field::new(m.new_password, "password", "password", "new-password"),
+            Field::new(m.repeat_password, "repeat", "password", "new-password"),
+        ],
+        error,
+        notice: None,
+        submit: m.set_password,
+        footer: None,
+    };
+    public_page(m.reset_label, &card.render())
+}
+
+/// `GET /reset/{token}`.
+pub(super) async fn reset_form(State(state): State<AppState>, Path(secret): Path<String>) -> Response {
+    match find_reset(&state, &Token(secret.clone())) {
+        Ok(Ok(_)) => reset_page(&secret, None).into_response(),
+        Ok(Err(e)) => link_error(e, ("/reset", msgs(Lang::Fr).reset_title)),
+        Err(e) => internal(&e),
+    }
+}
+
+/// Consume `token` and set the password of its account in `store`.
+fn apply_reset<K: Kind>(
+    store: &mut Store<K>,
+    token: &Token,
+    row: &IssuedToken,
+    hash: &auth::PasswordHash,
+) -> Result<bool, StoreError> {
+    let Some(account) = row.account else {
+        return Ok(false);
+    };
+    if !store.use_token(token)? {
+        return Ok(false);
+    }
+    store.set_password(account, hash)?;
+    Ok(true)
+}
+
+/// `POST /reset/{token}`: set the new password, consume the link, send
+/// the user to the login page (no session is opened).
+pub(super) async fn reset(
+    State(state): State<AppState>,
+    Path(secret): Path<String>,
+    Form(f): Form<PasswordForm>,
+) -> Response {
+    let token = Token(secret.clone());
+    let back = ("/reset", msgs(Lang::Fr).reset_title);
+    let (row, home) = match find_reset(&state, &token) {
+        Ok(Ok(found)) => found,
+        Ok(Err(e)) => return link_error(e, back),
+        Err(e) => return internal(&e),
+    };
+    let hash = match new_password(&f).await {
+        Ok(h) => h,
+        Err(msg) => return (StatusCode::BAD_REQUEST, reset_page(&secret, Some(msg))).into_response(),
+    };
+    let done = match home {
+        Database::Ledger => apply_reset(&mut *lock(&state.ledger), &token, &row, &hash),
+        Database::Dev => apply_reset(&mut *lock(&state.dev), &token, &row, &hash),
+    };
+    match done {
+        Ok(true) => see_other("/login?done=reset"),
+        Ok(false) => link_error(LinkError::Used, back),
+        Err(e) => internal(&e),
     }
 }
