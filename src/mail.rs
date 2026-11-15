@@ -32,33 +32,61 @@ pub struct Email {
 /// after 7 days (APP-26). The invitee has no account yet, so callers pass
 /// `Lang::default()` (French, APP-38) unless they know better.
 pub fn invite(to: &str, link: &str, lang: Lang) -> Email {
-    let _ = lang;
+    let (subject, body) = match lang {
+        Lang::Fr => (
+            "Invitation à témoigner sur Atomanja",
+            format!(
+                "Bonjour,\n\n\
+                 Vous êtes invité·e à devenir témoin sur Atomanja.\n\
+                 Pour créer votre compte, ouvrez ce lien :\n\n{link}\n\n\
+                 Ce lien ne sert qu'une fois et expire dans 7 jours.\n"
+            ),
+        ),
+        Lang::En => (
+            "Invitation to be a witness on Atomanja",
+            format!(
+                "Hello,\n\n\
+                 You are invited to become a witness on Atomanja.\n\
+                 To create your account, open this link:\n\n{link}\n\n\
+                 This link works once and expires in 7 days.\n"
+            ),
+        ),
+    };
     Email {
         to: to.to_owned(),
-        subject: "Invitation à témoigner sur Atomanja".to_owned(),
-        body: format!(
-            "Bonjour,\n\n\
-             Vous êtes invité·e à devenir témoin sur Atomanja.\n\
-             Pour créer votre compte, ouvrez ce lien :\n\n{link}\n\n\
-             Ce lien ne sert qu'une fois et expire dans 7 jours.\n"
-        ),
+        subject: subject.to_owned(),
+        body,
     }
 }
 
 /// Render the password-reset email: the reset link and its expiry time
 /// in UTC (APP-28), in the account's language (APP-39).
 pub fn reset(to: &str, link: &str, expires_at: OffsetDateTime, lang: Lang) -> Email {
-    let _ = lang;
     let when = utc_stamp(expires_at);
+    let (subject, body) = match lang {
+        Lang::Fr => (
+            "Réinitialisation de votre mot de passe Atomanja",
+            format!(
+                "Bonjour,\n\n\
+                 Pour choisir un nouveau mot de passe, ouvrez ce lien :\n\n{link}\n\n\
+                 Ce lien ne sert qu'une fois et expire le {when}.\n\
+                 Si vous n'avez rien demandé, ignorez ce message.\n"
+            ),
+        ),
+        Lang::En => (
+            "Reset your Atomanja password",
+            format!(
+                "Hello,\n\n\
+                 To choose a new password, open this link:\n\n{link}\n\n\
+                 This link works once and expires at {when}.\n\
+                 If you did not ask for this, ignore this message.\n"
+            ),
+        ),
+    };
     Email {
         to: to.to_owned(),
-        subject: "Réinitialisation de votre mot de passe Atomanja".to_owned(),
-        body: format!(
-            "Bonjour,\n\n\
-             Pour choisir un nouveau mot de passe, ouvrez ce lien :\n\n{link}\n\n\
-             Ce lien ne sert qu'une fois et expire le {when}.\n\
-             Si vous n'avez rien demandé, ignorez ce message.\n"
-        ),
+        subject: subject.to_owned(),
+        body,
     }
 }
 
