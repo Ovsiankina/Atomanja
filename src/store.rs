@@ -39,7 +39,10 @@ use std::path::Path;
 
 use crate::auth::{Account, AccountId, Database, IssuedToken, PasswordHash, Role, Token};
 use crate::config::Lang;
-use crate::ledger::{Change, Ledger, WitnessId};
+use crate::ledger::{
+    Centimes, Change, DebtId, EventKind, Ledger, OccurrenceId, Outcome, TaskId, Timestamp,
+    WitnessId,
+};
 
 /// Which file a [`Store`] handle is open on (DB-1, DEV-1, DEV-3).
 /// Implemented only by [`LedgerDb`] and [`DevDb`].
@@ -137,8 +140,60 @@ impl<K: Kind> Store<K> {
     /// of a debt, same occurrence or debt id twice, replayed batch);
     /// [`StoreError::Sqlite`] for any other database failure.
     pub fn append(&mut self, changes: &[Change]) -> Result<(), StoreError> {
-        let _ = changes;
-        todo!()
+        // Dropping the transaction on an early `?` rolls the batch back.
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO changes (kind, at, occurrence, debt, task, witness, amount, due, sub)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for change in changes {
+                let r = ChangeRow::encode(change);
+                insert.execute(rusqlite::params![
+                    r.kind,
+                    r.at,
+                    r.occurrence,
+                    r.debt,
+                    r.task,
+                    r.witness,
+                    r.amount,
+                    r.due,
+                    r.sub
+                ])?;
+                match *change {
+                    Change::Recorded {
+                        occurrence,
+                        deadline,
+                        ..
+                    } => {
+                        tx.execute(
+                            "INSERT INTO deadlines (occurrence, deadline) VALUES (?1, ?2)",
+                            rusqlite::params![occurrence.0, deadline.0],
+                        )?;
+                    }
+                    Change::Event {
+                        occurrence,
+                        kind: EventKind::MovedEarlier,
+                        new_due: Some(due),
+                        ..
+                    } => {
+                        // DECISION: same rule as `Ledger::apply`: only a
+                        // pending (undecided) occurrence follows an earlier
+                        // due date, so the table always matches the replay.
+                        tx.execute(
+                            "UPDATE deadlines SET deadline = ?2
+                             WHERE occurrence = ?1 AND deadline > ?2
+                               AND NOT EXISTS (SELECT 1 FROM changes
+                                               WHERE kind = ?3 AND occurrence = ?1)",
+                            rusqlite::params![occurrence.0, due.0, tag::DECIDED],
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Every stored change, in the order it was appended (DB-3).
@@ -148,7 +203,28 @@ impl<K: Kind> Store<K> {
     /// [`StoreError::Corrupt`] when a row does not decode to a change,
     /// [`StoreError::Sqlite`] for a database failure.
     pub fn load_changes(&self) -> Result<Vec<Change>, StoreError> {
-        todo!()
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, at, occurrence, debt, task, witness, amount, due, sub
+             FROM changes ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ChangeRow {
+                kind: r.get(0)?,
+                at: r.get(1)?,
+                occurrence: r.get(2)?,
+                debt: r.get(3)?,
+                task: r.get(4)?,
+                witness: r.get(5)?,
+                amount: r.get(6)?,
+                due: r.get(7)?,
+                sub: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?.decode()?);
+        }
+        Ok(out)
     }
 
     /// A ledger rebuilt by applying [`Store::load_changes`] in order to
@@ -158,7 +234,11 @@ impl<K: Kind> Store<K> {
     ///
     /// As [`Store::load_changes`].
     pub fn load_ledger(&self) -> Result<Ledger, StoreError> {
-        todo!()
+        let mut ledger = Ledger::new();
+        for change in self.load_changes()? {
+            ledger.apply(&change);
+        }
+        Ok(ledger)
     }
 
     // --- accounts (APP-25..APP-30, APP-39) ---
@@ -333,6 +413,252 @@ impl<K: Kind> Store<K> {
         let _ = endpoint;
         todo!()
     }
+}
+
+/// Stored `kind` values of the `changes` table, one per `Change` variant.
+// DECISION: explicit, stable discriminants owned by store, never derived
+// from the enum's declaration order, so reordering `ledger::Change` cannot
+// silently change what an existing file means. Never renumber; append.
+// The partial unique indexes in `SCHEMA` use these numbers literally.
+mod tag {
+    pub const RECORDED: i64 = 0;
+    pub const SEEN_DONE: i64 = 1;
+    pub const EVENT: i64 = 2;
+    pub const DECIDED: i64 = 3;
+    pub const DEBT_CREATED: i64 = 4;
+    pub const CLAIMED: i64 = 5;
+    pub const MARKED_SENT: i64 = 6;
+    pub const MARKED_RECEIVED: i64 = 7;
+    pub const AMOUNT_PROPOSED: i64 = 8;
+    pub const AMOUNT_APPROVED: i64 = 9;
+    pub const AMOUNT_IN_FORCE: i64 = 10;
+}
+
+/// One `changes` row. `sub` holds the variant's small field: the event
+/// kind, the outcome, or a bool (`done`, `automatic`).
+struct ChangeRow {
+    kind: i64,
+    at: i64,
+    occurrence: Option<i64>,
+    debt: Option<i64>,
+    task: Option<i64>,
+    witness: Option<i64>,
+    amount: Option<i64>,
+    due: Option<i64>,
+    sub: Option<i64>,
+}
+
+impl ChangeRow {
+    fn new(kind: i64, at: Timestamp) -> ChangeRow {
+        ChangeRow {
+            kind,
+            at: at.0,
+            occurrence: None,
+            debt: None,
+            task: None,
+            witness: None,
+            amount: None,
+            due: None,
+            sub: None,
+        }
+    }
+
+    fn encode(change: &Change) -> ChangeRow {
+        let occ = |o: OccurrenceId| Some(i64::from(o.0));
+        let debt = |d: DebtId| Some(i64::from(d.0));
+        let cents = |c: Centimes| Some(i64::from(c.0));
+        match *change {
+            Change::Recorded {
+                occurrence,
+                task,
+                deadline,
+                at,
+            } => ChangeRow {
+                occurrence: occ(occurrence),
+                task: Some(task.0),
+                due: Some(deadline.0),
+                ..ChangeRow::new(tag::RECORDED, at)
+            },
+            Change::SeenDone {
+                occurrence,
+                done,
+                at,
+            } => ChangeRow {
+                occurrence: occ(occurrence),
+                sub: Some(i64::from(done)),
+                ..ChangeRow::new(tag::SEEN_DONE, at)
+            },
+            Change::Event {
+                occurrence,
+                kind,
+                new_due,
+                at,
+            } => ChangeRow {
+                occurrence: occ(occurrence),
+                due: new_due.map(|t| t.0),
+                sub: Some(i64::from(kind as u8)),
+                ..ChangeRow::new(tag::EVENT, at)
+            },
+            Change::Decided {
+                occurrence,
+                outcome,
+                at,
+            } => ChangeRow {
+                occurrence: occ(occurrence),
+                sub: Some(i64::from(outcome as u8)),
+                ..ChangeRow::new(tag::DECIDED, at)
+            },
+            Change::DebtCreated {
+                debt: d,
+                occurrence,
+                amount,
+                at,
+            } => ChangeRow {
+                debt: debt(d),
+                occurrence: occ(occurrence),
+                amount: cents(amount),
+                ..ChangeRow::new(tag::DEBT_CREATED, at)
+            },
+            Change::Claimed {
+                debt: d,
+                witness,
+                automatic,
+                at,
+            } => ChangeRow {
+                debt: debt(d),
+                witness: Some(witness.0),
+                sub: Some(i64::from(automatic)),
+                ..ChangeRow::new(tag::CLAIMED, at)
+            },
+            Change::MarkedSent { debt: d, at } => ChangeRow {
+                debt: debt(d),
+                ..ChangeRow::new(tag::MARKED_SENT, at)
+            },
+            Change::MarkedReceived { debt: d, at } => ChangeRow {
+                debt: debt(d),
+                ..ChangeRow::new(tag::MARKED_RECEIVED, at)
+            },
+            Change::AmountProposed { amount, at } => ChangeRow {
+                amount: cents(amount),
+                ..ChangeRow::new(tag::AMOUNT_PROPOSED, at)
+            },
+            Change::AmountApproved { witness, at } => ChangeRow {
+                witness: Some(witness.0),
+                ..ChangeRow::new(tag::AMOUNT_APPROVED, at)
+            },
+            Change::AmountInForce { amount, at } => ChangeRow {
+                amount: cents(amount),
+                ..ChangeRow::new(tag::AMOUNT_IN_FORCE, at)
+            },
+        }
+    }
+
+    fn decode(&self) -> Result<Change, StoreError> {
+        let at = Timestamp(self.at);
+        let change = match self.kind {
+            tag::RECORDED => Change::Recorded {
+                occurrence: self.occurrence()?,
+                task: TaskId(need(self.task, "task")?),
+                deadline: Timestamp(need(self.due, "deadline")?),
+                at,
+            },
+            tag::SEEN_DONE => Change::SeenDone {
+                occurrence: self.occurrence()?,
+                done: self.flag()?,
+                at,
+            },
+            tag::EVENT => Change::Event {
+                occurrence: self.occurrence()?,
+                kind: match need(self.sub, "event kind")? {
+                    0 => EventKind::MovedLater,
+                    1 => EventKind::MovedEarlier,
+                    2 => EventKind::Removed,
+                    3 => EventKind::Deleted,
+                    n => return Err(corrupt(format!("event kind {n}"))),
+                },
+                new_due: self.due.map(Timestamp),
+                at,
+            },
+            tag::DECIDED => Change::Decided {
+                occurrence: self.occurrence()?,
+                outcome: match need(self.sub, "outcome")? {
+                    1 => Outcome::Met,
+                    2 => Outcome::Late,
+                    n => return Err(corrupt(format!("outcome {n}"))),
+                },
+                at,
+            },
+            tag::DEBT_CREATED => Change::DebtCreated {
+                debt: self.debt()?,
+                occurrence: self.occurrence()?,
+                amount: self.amount()?,
+                at,
+            },
+            tag::CLAIMED => Change::Claimed {
+                debt: self.debt()?,
+                witness: WitnessId(need(self.witness, "witness")?),
+                automatic: self.flag()?,
+                at,
+            },
+            tag::MARKED_SENT => Change::MarkedSent {
+                debt: self.debt()?,
+                at,
+            },
+            tag::MARKED_RECEIVED => Change::MarkedReceived {
+                debt: self.debt()?,
+                at,
+            },
+            tag::AMOUNT_PROPOSED => Change::AmountProposed {
+                amount: self.amount()?,
+                at,
+            },
+            tag::AMOUNT_APPROVED => Change::AmountApproved {
+                witness: WitnessId(need(self.witness, "witness")?),
+                at,
+            },
+            tag::AMOUNT_IN_FORCE => Change::AmountInForce {
+                amount: self.amount()?,
+                at,
+            },
+            n => return Err(corrupt(format!("change kind {n}"))),
+        };
+        Ok(change)
+    }
+
+    fn occurrence(&self) -> Result<OccurrenceId, StoreError> {
+        u32_col(self.occurrence, "occurrence").map(OccurrenceId)
+    }
+
+    fn debt(&self) -> Result<DebtId, StoreError> {
+        u32_col(self.debt, "debt").map(DebtId)
+    }
+
+    fn amount(&self) -> Result<Centimes, StoreError> {
+        u32_col(self.amount, "amount").map(Centimes)
+    }
+
+    fn flag(&self) -> Result<bool, StoreError> {
+        match need(self.sub, "flag")? {
+            0 => Ok(false),
+            1 => Ok(true),
+            n => Err(corrupt(format!("flag {n}"))),
+        }
+    }
+}
+
+fn corrupt(what: String) -> StoreError {
+    StoreError::Corrupt(what)
+}
+
+/// A column the row's kind requires.
+fn need(value: Option<i64>, what: &str) -> Result<i64, StoreError> {
+    value.ok_or_else(|| corrupt(format!("missing {what}")))
+}
+
+/// A required column that must fit a `u32` id or amount.
+fn u32_col(value: Option<i64>, what: &str) -> Result<u32, StoreError> {
+    let v = need(value, what)?;
+    u32::try_from(v).map_err(|_| corrupt(format!("{what} {v} out of range")))
 }
 
 /// Why a store operation failed. On any error, nothing was written.
@@ -557,11 +883,277 @@ mod tests {
     }
 
     // store-02
-    #[test] fn db_2_ledger_rows_insert_only() { todo!() }
-    #[test] fn db_2_only_app_7_updates_recorded_deadline() { todo!() }
-    #[test] fn db_3_load_after_restart_equals_state_before() { todo!() }
-    #[test] fn store_poll_changes_appended_in_one_transaction() { todo!() }
-    #[test] fn store_reapplying_same_poll_no_duplicate_debt() { todo!() }
+    use crate::ledger::{
+        Centimes, DebtId, EventKind, Observation, OccurrenceId, Outcome, RepeatMode, Snapshot,
+        TaskId, Timestamp,
+    };
+
+    fn recorded(occ: u32, task: i64, deadline: i64, at: i64) -> Change {
+        Change::Recorded {
+            occurrence: OccurrenceId(occ),
+            task: TaskId(task),
+            deadline: Timestamp(deadline),
+            at: Timestamp(at),
+        }
+    }
+
+    fn event(occ: u32, kind: EventKind, new_due: Option<i64>, at: i64) -> Change {
+        Change::Event {
+            occurrence: OccurrenceId(occ),
+            kind,
+            new_due: new_due.map(Timestamp),
+            at: Timestamp(at),
+        }
+    }
+
+    fn debt_created(debt: u32, occ: u32, at: i64) -> Change {
+        Change::DebtCreated {
+            debt: DebtId(debt),
+            occurrence: OccurrenceId(occ),
+            amount: Centimes::DEFAULT_AMOUNT,
+            at: Timestamp(at),
+        }
+    }
+
+    fn deadline_row<K: Kind>(store: &Store<K>, occ: u32) -> Option<i64> {
+        use rusqlite::OptionalExtension;
+        store
+            .conn
+            .query_row(
+                "SELECT deadline FROM deadlines WHERE occurrence = ?1",
+                [occ],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn obs(task: i64, due: Option<i64>) -> Observation {
+        Observation {
+            due: due.map(Timestamp),
+            done_at: None,
+            task: TaskId(task),
+            repeat_after_secs: 0,
+            repeat_mode: RepeatMode::Interval,
+            done: false,
+            archived: false,
+        }
+    }
+
+    /// Persist then apply, the way `sync` and `web` will.
+    fn commit(store: &mut Store<LedgerDb>, live: &mut Ledger, changes: &[Change]) {
+        store.append(changes).unwrap();
+        for c in changes {
+            live.apply(c);
+        }
+    }
+
+    #[test]
+    fn db_2_ledger_rows_insert_only() {
+        let mut store = Store::<LedgerDb>::open_in_memory().unwrap();
+        let first = vec![recorded(0, 1, 1000, 10)];
+        let second = vec![event(0, EventKind::MovedLater, Some(2000), 20)];
+        store.append(&first).unwrap();
+        store.append(&second).unwrap();
+        let before = store.load_changes().unwrap();
+        assert_eq!(before, [first, second].concat());
+
+        assert!(store.conn.execute("UPDATE changes SET at = 0", []).is_err());
+        assert!(store.conn.execute("DELETE FROM changes", []).is_err());
+        assert_eq!(store.load_changes().unwrap(), before);
+    }
+
+    #[test]
+    fn db_2_only_app_7_updates_recorded_deadline() {
+        let mut store = Store::<LedgerDb>::open_in_memory().unwrap();
+        let rec = recorded(0, 1, 1000, 10);
+        store.append(std::slice::from_ref(&rec)).unwrap();
+        assert_eq!(deadline_row(&store, 0), Some(1000));
+
+        store
+            .append(&[event(0, EventKind::MovedLater, Some(1500), 20)])
+            .unwrap();
+        assert_eq!(deadline_row(&store, 0), Some(1000));
+
+        store
+            .append(&[event(0, EventKind::MovedEarlier, Some(800), 30)])
+            .unwrap();
+        assert_eq!(deadline_row(&store, 0), Some(800));
+        // The Recorded fact itself is untouched.
+        assert_eq!(store.load_changes().unwrap()[0], rec);
+        assert_eq!(
+            store.load_ledger().unwrap().occurrences().deadline,
+            vec![Timestamp(800)]
+        );
+
+        // Never later, never deleted, even by hand.
+        assert!(
+            store
+                .conn
+                .execute("UPDATE deadlines SET deadline = 900", [])
+                .is_err()
+        );
+        assert!(store.conn.execute("DELETE FROM deadlines", []).is_err());
+
+        // A decided occurrence keeps its deadline (APP-7, APP-10).
+        store
+            .append(&[Change::Decided {
+                occurrence: OccurrenceId(0),
+                outcome: Outcome::Met,
+                at: Timestamp(40),
+            }])
+            .unwrap();
+        store
+            .append(&[event(0, EventKind::MovedEarlier, Some(500), 50)])
+            .unwrap();
+        assert_eq!(deadline_row(&store, 0), Some(800));
+        assert_eq!(
+            store.load_ledger().unwrap().occurrences().deadline,
+            vec![Timestamp(800)]
+        );
+    }
+
+    #[test]
+    fn db_3_load_after_restart_equals_state_before() {
+        let file = TempFile::new("db3");
+        let w1 = WitnessId(1);
+        let w2 = WitnessId(2);
+        let witnesses = [w1, w2];
+        let mut live = Ledger::new();
+        let mut all = Vec::new();
+        {
+            let mut store = Store::<LedgerDb>::open(&file.0).unwrap();
+            let poll = |store: &mut Store<LedgerDb>, live: &mut Ledger, all: &mut Vec<Change>, tasks, now| {
+                let changes = live.observe(&Snapshot { tasks }, Timestamp(now), &witnesses);
+                commit(store, live, &changes);
+                all.extend(changes);
+            };
+            poll(
+                &mut store,
+                &mut live,
+                &mut all,
+                vec![obs(1, Some(100)), obs(2, Some(200)), obs(3, Some(300))],
+                0,
+            );
+            let mut t2_done = obs(2, Some(200));
+            t2_done.done = true;
+            t2_done.done_at = Some(Timestamp(50));
+            poll(
+                &mut store,
+                &mut live,
+                &mut all,
+                vec![obs(1, Some(80)), t2_done.clone(), obs(3, Some(300))],
+                50,
+            );
+            poll(
+                &mut store,
+                &mut live,
+                &mut all,
+                vec![obs(1, Some(80)), t2_done.clone(), obs(3, Some(300))],
+                150,
+            );
+            assert_eq!(live.debts().occurrence.len(), 1);
+
+            let mut manual = Vec::new();
+            manual.push(live.claim(DebtId(0), w1, &witnesses, Timestamp(160)).unwrap());
+            commit(&mut store, &mut live, &manual[manual.len() - 1..]);
+            manual.push(live.mark_sent(DebtId(0), Timestamp(170)).unwrap());
+            commit(&mut store, &mut live, &manual[manual.len() - 1..]);
+            manual.push(live.propose_amount(Centimes(2000), Timestamp(175)).unwrap());
+            commit(&mut store, &mut live, &manual[manual.len() - 1..]);
+            for w in witnesses {
+                let changes = live.approve_amount(w, &witnesses, Timestamp(180)).unwrap();
+                commit(&mut store, &mut live, &changes);
+                manual.extend(changes);
+            }
+            manual.push(live.mark_received(DebtId(0), w1, Timestamp(190)).unwrap());
+            commit(&mut store, &mut live, &manual[manual.len() - 1..]);
+            all.extend(manual);
+
+            poll(
+                &mut store,
+                &mut live,
+                &mut all,
+                vec![obs(1, Some(80)), t2_done.clone(), obs(3, None)],
+                250,
+            );
+            poll(&mut store, &mut live, &mut all, vec![obs(1, Some(80)), t2_done], 400);
+            assert_eq!(live.amount(), Centimes(2000));
+        }
+        // Restart: a new handle on the same file.
+        let store = Store::<LedgerDb>::open(&file.0).unwrap();
+        assert_eq!(store.load_changes().unwrap(), all);
+        let loaded = store.load_ledger().unwrap();
+        assert_eq!(format!("{loaded:?}"), format!("{live:?}"));
+        assert_eq!(loaded.totals(), live.totals());
+    }
+
+    #[test]
+    fn store_poll_changes_appended_in_one_transaction() {
+        let mut store = Store::<LedgerDb>::open_in_memory().unwrap();
+        let ok = vec![
+            recorded(0, 1, 1000, 10),
+            Change::Decided {
+                occurrence: OccurrenceId(0),
+                outcome: Outcome::Late,
+                at: Timestamp(1100),
+            },
+            debt_created(0, 0, 1100),
+        ];
+        store.append(&ok).unwrap();
+        assert_eq!(store.load_changes().unwrap(), ok);
+
+        // The last change of this batch conflicts: nothing of it is kept,
+        // not even the deadline update of the MovedEarlier in the middle.
+        let bad = vec![
+            recorded(1, 2, 5000, 1200),
+            event(1, EventKind::MovedEarlier, Some(4000), 1300),
+            debt_created(0, 1, 1300),
+        ];
+        assert!(matches!(store.append(&bad), Err(StoreError::Conflict)));
+        assert_eq!(store.load_changes().unwrap(), ok);
+        assert_eq!(deadline_row(&store, 1), None);
+
+        // The handle is still usable after the rollback.
+        store.append(&bad[..2]).unwrap();
+        assert_eq!(deadline_row(&store, 1), Some(4000));
+        assert_eq!(store.load_changes().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn store_reapplying_same_poll_no_duplicate_debt() {
+        let mut store = Store::<LedgerDb>::open_in_memory().unwrap();
+        let mut live = Ledger::new();
+        let witnesses = [WitnessId(1), WitnessId(2)];
+        let first = live.observe(
+            &Snapshot {
+                tasks: vec![obs(1, Some(100))],
+            },
+            Timestamp(0),
+            &witnesses,
+        );
+        commit(&mut store, &mut live, &first);
+        let late = live.observe(
+            &Snapshot {
+                tasks: vec![obs(1, Some(100))],
+            },
+            Timestamp(200),
+            &witnesses,
+        );
+        assert!(late.iter().any(|c| matches!(c, Change::DebtCreated { .. })));
+        store.append(&late).unwrap();
+
+        // Crash before apply, restart, same poll persisted again.
+        assert!(matches!(store.append(&late), Err(StoreError::Conflict)));
+        // A second debt for the same occurrence under a new id (APP-12).
+        assert!(matches!(
+            store.append(&[debt_created(1, 0, 300)]),
+            Err(StoreError::Conflict)
+        ));
+        let loaded = store.load_ledger().unwrap();
+        assert_eq!(loaded.debts().occurrence.len(), 1);
+        assert_eq!(store.load_changes().unwrap(), [first, late].concat());
+    }
 
     // store-03
     #[test] fn store_concurrent_claims_one_row() { todo!() }
