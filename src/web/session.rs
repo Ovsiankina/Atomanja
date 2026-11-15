@@ -91,6 +91,8 @@ pub(super) fn actor(state: &AppState, headers: &HeaderMap) -> Result<Option<Acto
             token,
         }));
     }
+    // DECISION: only the admin is ever accepted from the dev file, so a
+    // fake witness written there by devdata can never act on the ledger.
     let dev = session_in(&*lock(&state.dev), &token, at)?;
     Ok(dev.filter(|a| a.role == Role::Admin).map(|account| Actor {
         account,

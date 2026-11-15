@@ -153,6 +153,8 @@ pub(super) fn row(ctx: &Ctx<'_>, ledger: &Ledger, o: usize, d: Option<usize>, er
     }
 }
 
+// DECISION: an owner is named by account email (accounts carry no display
+// name); the reader's own claims read "you".
 /// "Unclaimed", "Claimed by you", "Claimed by a@b".
 fn owner_text(ctx: &Ctx<'_>, owner: Option<WitnessId>) -> String {
     let m = ctx.m;
@@ -204,6 +206,8 @@ pub(super) fn dashboard(ctx: &Ctx<'_>, ledger: &Ledger, error: Option<(usize, &s
             @if ctx.viewer == Viewer::Admin {
                 div.page__pinned { (pages::banner(true, m.fake_label, m.fake_text)) }
             }
+            // DECISION: witnesses see the same three ledger totals as the
+            // worker; the design system opens both dashboards with Totals.
             (pages::totals(m, &ledger.totals(), false))
             div.at-views {
                 div.at-views__bar {

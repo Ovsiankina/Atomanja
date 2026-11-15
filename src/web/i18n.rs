@@ -327,6 +327,8 @@ const FR: Msgs = Msgs {
     link_unknown: "Ce lien n'est pas valide.",
     back_to_login: "Retour à la connexion",
     a_worker: "Le travailleur",
+    // DECISION: French dates use the usual short month ("14 nov."); the
+    // README's "14 Nov" is the English form.
     months: [
         "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.",
         "déc.",

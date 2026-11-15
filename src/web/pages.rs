@@ -137,6 +137,8 @@ impl<'a> Field<'a> {
     }
 }
 
+// DECISION: met uses the neutral Tag with its word; the design system has
+// no met state and forbids inventing a coloured status.
 /// The task statuses the views print. `Met` is shown with the neutral
 /// tag: the design system has four debt states, the SRS also needs met
 /// (APP-31, APP-32).
