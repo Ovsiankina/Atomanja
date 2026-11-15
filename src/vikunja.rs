@@ -212,6 +212,11 @@ pub async fn fetch_all<S: PageSource + Sync>(source: &S) -> Result<Vec<Task>, Vi
     for body in fetch_pages(source, Resource::Tasks).await? {
         tasks.extend(parse_tasks(&body)?);
     }
+    // DECISION: a task that shifted forward across a page boundary
+    // between two page reads shows up twice; keep the first copy so the
+    // snapshot holds each id once (APP-3).
+    let mut seen = std::collections::HashSet::new();
+    tasks.retain(|t| seen.insert(t.id));
     let mut projects = Vec::new();
     for body in fetch_pages(source, Resource::Projects).await? {
         projects.extend(parse_projects(&body)?);
@@ -222,7 +227,12 @@ pub async fn fetch_all<S: PageSource + Sync>(source: &S) -> Result<Vec<Task>, Vi
 
 // DECISION: pages are fetched one after another; page 1 says how many
 // there are. Sequential keeps the load on Vikunja low and makes the
-// first error stop the walk.
+// first error stop the walk. Every page must report the same page count
+// as page 1: a different count means the list grew or shrank mid-walk,
+// so items may have shifted past a boundary and a task may be missing.
+// That fails the fetch (retried next poll) instead of passing a list
+// where a skipped task looks deleted (APP-6). A shrink that does not
+// change the page count stays undetectable with offset paging.
 async fn fetch_pages<S: PageSource + Sync>(
     source: &S,
     resource: Resource,
@@ -231,12 +241,22 @@ async fn fetch_pages<S: PageSource + Sync>(
     let total = first.total_pages.max(1);
     let mut bodies = vec![first.body];
     for n in 2..=total {
-        bodies.push(source.page(resource, n).await?.body);
+        let next = source.page(resource, n).await?;
+        if next.total_pages.max(1) != total {
+            // DECISION: reported as Parse (unexpected response); the pub
+            // enum is frozen and any error means "no snapshot this poll".
+            return Err(VikunjaError::Parse(format!(
+                "{resource:?} page count changed during fetch: {total} then {}",
+                next.total_pages
+            )));
+        }
+        bodies.push(next.body);
     }
     Ok(bodies)
 }
 
-// DECISION: 50 per page is Vikunja's default maximum.
+// DECISION: 50 per page is Vikunja's default `max_items_per_page`, and
+// the installed v2.6.0 reports exactly 50; larger values are clamped.
 const PER_PAGE: u32 = 50;
 // DECISION: a poll that hangs longer than this counts as unreachable.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -277,11 +297,16 @@ impl Client {
     ///
     /// [`VikunjaError::Transport`] when the URL cannot be built.
     pub fn request(&self, resource: Resource, page: u32) -> Result<reqwest::Request, VikunjaError> {
-        // DECISION: `vikunja_url` is the server root; the API lives under
-        // `/api/v1`. Tasks via `/tasks/all`, projects with
-        // `is_archived=true` so archived ones are listed too (APP-3).
+        // DECISION: checked against Vikunja v2.6.0 (vikunja-01).
+        // `vikunja_url` is the server root; the API lives under `/api/v1`.
+        // Tasks via `GET /tasks` (`/tasks/all` no longer exists), sorted by
+        // id ascending so page boundaries are stable: a task created
+        // mid-walk gets a higher id and lands on the last page, not in
+        // the middle. Projects with `is_archived=true` so archived ones
+        // are listed too (APP-3); `/tasks` already leaves out tasks of
+        // archived projects.
         let (path, extra): (&str, &[(&str, &str)]) = match resource {
-            Resource::Tasks => ("tasks/all", &[]),
+            Resource::Tasks => ("tasks", &[("sort_by", "id"), ("order_by", "asc")]),
             Resource::Projects => ("projects", &[("is_archived", "true")]),
         };
         // DECISION: the query is built on `Url` directly; `RequestBuilder::query`
@@ -513,7 +538,19 @@ mod tests {
                 );
             }
         }
+        // vikunja-01: v2.6.0 serves the task list at `/api/v1/tasks`
+        // (`/tasks/all` is a 404), in a stable id order.
+        let tasks = client.request(Resource::Tasks, 2).expect("request");
+        assert_eq!(tasks.url().path(), "/api/v1/tasks");
+        let pairs: Vec<(String, String)> = tasks.url().query_pairs().into_owned().collect();
+        for want in [("sort_by", "id"), ("order_by", "asc"), ("per_page", "50")] {
+            assert!(
+                pairs.iter().any(|(k, v)| k == want.0 && v == want.1),
+                "{want:?} missing in {pairs:?}"
+            );
+        }
         let projects = client.request(Resource::Projects, 1).expect("request");
+        assert_eq!(projects.url().path(), "/api/v1/projects");
         assert!(
             projects
                 .url()
@@ -585,6 +622,47 @@ mod tests {
             assert!(
                 fetch_all(&source).await.is_err(),
                 "{key:?} must fail the fetch"
+            );
+        }
+    }
+
+    // vikunja-review (APP-3): a task that shifts across a page boundary
+    // between two page reads is returned once, not twice.
+    #[tokio::test]
+    async fn vikunja_task_seen_on_two_pages_is_returned_once() {
+        let mut source = healthy();
+        let both = format!(
+            "[{},{}]",
+            task_json("").trim_matches(|c| c == '[' || c == ']'),
+            task_json("")
+                .replace(r#""id":42"#, r#""id":43"#)
+                .replace(r#""project_id":7"#, r#""project_id":8"#)
+                .trim_matches(|c| c == '[' || c == ']')
+        );
+        source
+            .pages
+            .insert((Resource::Tasks, 2), Ok(page(&both, 2)));
+        let tasks = fetch_all(&source).await.expect("fetch ok");
+        let ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![42, 43]);
+    }
+
+    // vikunja-review (APP-3): the list changed size mid-walk, so items
+    // may have shifted past a page boundary; the poll must fail, not
+    // return a list that may silently miss a task.
+    #[tokio::test]
+    async fn vikunja_page_count_change_mid_fetch_fails_whole_fetch() {
+        for (key, total) in [((Resource::Tasks, 2), 3), ((Resource::Projects, 2), 1)] {
+            let mut source = healthy();
+            let body = match source.pages.get(&key) {
+                Some(Ok(p)) => p.body.clone(),
+                other => panic!("fixture {key:?}: {other:?}"),
+            };
+            source.pages.insert(key, Ok(page(&body, total)));
+            source.pages.insert((key.0, 3), Ok(page("[]", total)));
+            assert!(
+                fetch_all(&source).await.is_err(),
+                "{key:?} total {total} must fail the fetch"
             );
         }
     }
